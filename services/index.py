@@ -1,5 +1,7 @@
 import os
 import pickle
+from torch.utils.data import Dataset
+import numpy as np
 
 class Index:
     def __init__(self, base_filename):
@@ -77,3 +79,63 @@ class Index:
         self.iterations = []
         
         print("Index is cleared successfully.")
+
+
+class IndexDataset(Dataset):
+    def __init__(
+        self,
+        index: Index,
+        dataset: Dataset,
+        process_elements=lambda x, y: (x, y),
+        split="train",
+        load_all_data=False,
+        train_split=0.8,
+        val_split=0.9,
+    ):
+        self.index = index
+        self.dataset = dataset
+        self.split = split
+        self.process_elements = process_elements
+
+        if split == "train":
+            self.indices = list(range(int(len(index) * train_split)))
+        elif split == "val":
+            self.indices = list(
+                range(
+                    int(len(index) * train_split), int(len(index) * val_split)
+                )
+            )
+        else:
+            self.indices = list(range(int(len(index) * val_split), len(index)))
+
+        if load_all_data:
+            self._load_data()
+
+    def __len__(self):
+        return len(self.indices) - 1
+
+    def _load_data(self):
+        self.data = self.process_elements(
+            np.array(self.index.load_data(self.indices[0], self.indices[-1])),
+            np.array(
+                self.dataset.select(range(self.indices[0], self.indices[-1]))
+            ),
+        )
+
+    def get(self, start=0, end=-1):
+        if self.data:
+            return {k: v[start:end] for k, v in self.data.items()}
+
+        xs = np.array(
+            [
+                x
+                for x in self.index.load_data(
+                    self.indices[start], self.indices[end]
+                )
+            ]
+        )
+        ys = np.array(
+            self.dataset.select(range(self.indices[start], self.indices[end]))
+        )
+
+        return self.process_elements(xs, ys)
