@@ -1,8 +1,8 @@
 def retrieve_answer_token_index(tokens):
-    for i in range(len(tokens) - 1, 0, -1):
-        if tokens[i]["token"].isdigit():
-            return i
-
+    for i in range(len(tokens), 0, -1):
+        if tokens[i-1]["token"].isdigit():
+            return i - 1
+ 
 
 # field1_text = '"short_chain_of_thoughts": "'
 # field2_text = '"answer": "'

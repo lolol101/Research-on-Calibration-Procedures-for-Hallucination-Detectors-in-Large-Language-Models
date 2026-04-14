@@ -85,7 +85,6 @@ class IndexDataset(Dataset):
     def __init__(
         self,
         index: Index,
-        dataset: Dataset,
         process_elements=lambda x, y: (x, y),
         split="train",
         load_all_data=False,
@@ -93,8 +92,9 @@ class IndexDataset(Dataset):
         val_split=0.9,
     ):
         self.index = index
-        self.dataset = dataset
         self.split = split
+        
+        # Expexting a function that returns dict of arrays
         self.process_elements = process_elements
 
         if split == "train":
@@ -116,26 +116,21 @@ class IndexDataset(Dataset):
 
     def _load_data(self):
         self.data = self.process_elements(
-            np.array(self.index.load_data(self.indices[0], self.indices[-1])),
-            np.array(
-                self.dataset.select(range(self.indices[0], self.indices[-1]))
-            ),
+            np.array(self.index.load_data(self.indices[0], self.indices[-1]))
         )
 
-    def get(self, start=0, end=-1):
+    def get(self, start=0, end=None):
         if self.data:
-            return {k: v[start:end] for k, v in self.data.items()}
+            return {
+                k: v[start:end] 
+                    for k, v in self.data.items()
+            }
 
-        xs = np.array(
-            [
-                x
-                for x in self.index.load_data(
-                    self.indices[start], self.indices[end]
-                )
-            ]
+        return self.process_elements(
+            self.index.load_data(
+                self.indices[start], 
+                self.indices[self.indices[end] if end else None]
+            )
         )
-        ys = np.array(
-            self.dataset.select(range(self.indices[start], self.indices[end]))
-        )
-
-        return self.process_elements(xs, ys)
+        
+    # TODO: def get_generator(self, start=0, end=None):
