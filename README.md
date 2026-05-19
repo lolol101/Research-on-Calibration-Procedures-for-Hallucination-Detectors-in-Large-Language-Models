@@ -6,7 +6,7 @@
 
 ## Description
 
-This project focuses on improving the reliability of hallucination detection in Large Language Models (LLMs). Hallucinations refer to outputs that are fluent and plausible but factually incorrect. The goal of this research is to develop a novel calibration method that produces confidence scores aligned with the true correctness of model responses.
+This project focuses on improving the calibration process of Large Language Models (LLMs). Hallucinations refer to outputs that are fluent and plausible but factually incorrect. The goal of this research is to develop a novel calibration method that produces confidence scores aligned with the true correctness of model responses.
 
 Unlike existing approaches that rely mainly on final output probabilities, this work leverages internal model signals, including attention mechanisms and intermediate reasoning steps (Chain of Thought). The proposed method uses entropy-based metrics to extract uncertainty information and improve calibration quality.
 
@@ -46,15 +46,10 @@ These datasets provide labeled data necessary for evaluating hallucination detec
 
 The method is evaluated using:
 
-* **Detection Quality:** ROC-AUC score for distinguishing hallucinated vs factual outputs
+* **Head Selection:** ROC-AUC and HDP scores to define attetnion heads which better distinguish hallucinated from factual outputs
 * **Calibration Quality:** Expected Calibration Error (ECE) and its variants
 
 ## Expected Outcomes
 
 * Improved calibration of confidence scores
-* Better detection of hallucinated outputs
 * Enhanced understanding of internal model signals for uncertainty estimation
-
-## References
-
-The project builds upon prior work in calibration, entropy-based uncertainty estimation, and attention-based hallucination detection.
