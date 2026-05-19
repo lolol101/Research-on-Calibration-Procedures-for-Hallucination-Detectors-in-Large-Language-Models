@@ -1,10 +1,14 @@
+import io
 import os
 import pickle
-from torch.utils.data import Dataset
+
 import numpy as np
+import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
 
 class Index:
-    def __init__(self, base_filename):
+    def __init__(self, base_filename, verbose=False):
         self.base_filename = base_filename
         self.index_filename = f"{base_filename}_index.pkl"
         self.data_filename = f"{base_filename}_data.pkl"
@@ -40,22 +44,24 @@ class Index:
         if logging:
             print("Saved data" + f": iteration {iter}" if iter != -1 else "")
             
-    def load_data(self, start_iter=0, end_iter=None):
-        """Loads all data (avoid in case if data is too heavy)"""
+    def load_data(self, start_iter=0, end_iter=None, verbose=False):
         data = []
         with open(self.data_filename, "rb") as f:
-            for i in range(start_iter, end_iter if end_iter else len(self.offsets)):
+            for i in tqdm(
+                    range(start_iter, end_iter if end_iter else len(self.offsets)),
+                    desc="Loading index...",
+                    disable=not verbose
+                ):
                 f.seek(self.offsets[i])
                 data.append(pickle.load(f))
             return data 
 
     def load_data_generator(self, start_iter=0, end_iter=None, batch_size=1):
-        """Makes data generator for heavy data"""
         data = []
         with open(self.data_filename, "rb") as f:
             for i in range(start_iter, end_iter if end_iter else len(self.offsets)):
                 f.seek(self.offsets[i])
-                data.append(pickle.load(f))   
+                data.append(pickle.load(f))
                 if len(data) == batch_size or i == end_iter - 1:
                     yield data
     
@@ -90,11 +96,12 @@ class IndexDataset(Dataset):
         load_all_data=False,
         train_split=0.8,
         val_split=0.9,
+        verbose=False
     ):
         self.index = index
         self.split = split
-        
-        # Expexting a function that returns dict of arrays
+        self.data = None
+        self.verbose = verbose
         self.process_elements = process_elements
 
         if split == "train":
@@ -116,7 +123,12 @@ class IndexDataset(Dataset):
 
     def _load_data(self):
         self.data = self.process_elements(
-            np.array(self.index.load_data(self.indices[0], self.indices[-1]))
+            np.array(self.index.load_data(
+                self.indices[0], 
+                self.indices[-1], 
+                verbose=self.verbose
+            )),
+            verbose=self.verbose
         )
 
     def get(self, start=0, end=None):
@@ -129,8 +141,10 @@ class IndexDataset(Dataset):
         return self.process_elements(
             self.index.load_data(
                 self.indices[start], 
-                self.indices[self.indices[end] if end else None]
-            )
+                self.indices[end] if end else self.indices[-1],
+                verbose=self.verbose
+            ),
+            verbose=self.verbose
         )
         
     # TODO: def get_generator(self, start=0, end=None):

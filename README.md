@@ -1,4 +1,4 @@
-# Diplom
+# Hallucination_Research
 
 ## Project Title
 
@@ -33,7 +33,7 @@ The approach consists of two main stages:
 Experiments are conducted on open-source LLMs with accessible internal states:
 
 * Qwen2.5-7B-Instruct
-* Mistral-8B
+* Llama3-8B
 
 ## Datasets
 

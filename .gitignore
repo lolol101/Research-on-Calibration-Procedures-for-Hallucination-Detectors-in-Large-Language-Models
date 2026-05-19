@@ -3,3 +3,10 @@ index_data
 .ipynb_checkpoints
 .venv
 tasks/tmp
+*.egg-info
+dist
+tasks/tmp
+tmp
+docs
+__pycache__
+**/logs*/
