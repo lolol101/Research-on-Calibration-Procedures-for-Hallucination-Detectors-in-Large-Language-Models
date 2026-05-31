@@ -1,0 +1,12 @@
+index_data
+.vscode
+.ipynb_checkpoints
+.venv
+tasks/tmp
+*.egg-info
+dist
+tasks/tmp
+tmp
+docs
+**/__pycache__/
+**/logs*/
