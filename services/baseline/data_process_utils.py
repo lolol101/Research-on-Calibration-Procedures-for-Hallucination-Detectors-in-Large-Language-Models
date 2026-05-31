@@ -5,6 +5,18 @@ from tqdm import tqdm
 from services.common.calculation_utils import calculate_norm_entropy
 
 def retrieve_answer_token_index(tokens):
+    """
+    Finds the index of the last digit token in a scored sequence - the answer token in current context.
+
+    Scans ``tokens`` from the end toward the start and returns the index of
+    the rightmost entry whose ``"token"`` field is numeric.
+
+    Args:
+        tokens: List of per-token score dicts with a ``"token"`` key.
+
+    Returns:
+        Index of the answer token, or ``None`` if no digit is found.
+    """
     for i in range(len(tokens), 0, -1):
         if tokens[i-1]["token"].isdigit():
             return i - 1
@@ -14,6 +26,28 @@ def process_elements_main(
     device: torch.device, 
     verbose=False
     ):
+    """
+    Builds baseline calibration tensors from indexed inference records.
+
+    For each element in ``index_data``, locates the multiple-choice answer
+    token, derives binary correctness labels, and stacks final-token
+    confidence (``features``) plus top-k logits (``logits``). Elements whose
+    answer token is the last scored position are skipped.
+
+    Args:
+        index_data: Array of dicts with ``score_data`` (token scores) and
+            ``dataset_elem`` (must include ``answer`` as letter in upper register).
+        device: torch.device to perform computations on.
+        verbose: If True, show a tqdm progress bar over the feature pass.
+
+    Returns:
+        Dict with tensors on ``device``:
+        - ``labels``: 0/1 correctness per sample, shape ``[B]``.
+        - ``gen_tok_ids``: Index of the generated answer token in ``top_tokens``.
+        - ``answer_tok_ids``: Index of the factual answer token in ``top_tokens``.
+        - ``features``: Clamped final-token probability, shape ``[B, 1]``.
+        - ``logits``: Top-k logits at the answer position, shape ``[B, TOP_K]``.
+    """
     processed = {}
 
     labels = []

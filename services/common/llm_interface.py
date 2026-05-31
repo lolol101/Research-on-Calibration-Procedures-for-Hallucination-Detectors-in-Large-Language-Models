@@ -23,6 +23,18 @@ class LLMInterface(Runnable):
         lower_logit_limit: float = DEFAULT_LOWER_LOGIT_LIMIT,
         upper_logit_limit: float = DEFAULT_UPPER_LOGIT_LIMIT,
     ):
+        """
+        Initialization of a class.
+
+        Args:
+            model: Causal LM with ``generate`` supporting scores and attentions.
+            tokenizer: Chat-template-capable tokenizer.
+            device: torch.device to perform computations on.
+            topk: Number of top logits/probs stored per generated token.
+            lower_prob_limit: Minimum clamp for attention probabilities.
+            lower_logit_limit: Minimum clamp for stored top logits.
+            upper_logit_limit: Maximum clamp for stored top logits.
+        """
         self.model = model
         self.tokenizer = tokenizer
         self.hook_handles = []
@@ -40,6 +52,17 @@ class LLMInterface(Runnable):
         config: RunnableConfig | None = None,
         **kwargs: Any,
     ):
+        """Generate a response and collect per-token logits, probs, and attention stats.
+
+        Args:
+            messages: LangChain message list (system + user expected).
+            config: Optional LangChain runnable config.
+            **kwargs: Extra generation.
+
+        Returns:
+            Dict with ``input_text``, ``output_text``, ``score_data`` (per-token dicts), 
+            ``attention_entropy``, and ``norm_attention_entropy``.
+        """
         hf_messages = [
             {"role": "system", "content": messages.messages[0].content},
             {"role": "user", "content": messages.messages[1].content},

@@ -24,6 +24,26 @@ def test_calibration_model(
     log_dir: Optional[str] = None,
     eps: float = 1e-8,
 ):
+    """
+    Calculates set of metrics on the calibrated probabilities.
+
+    Computes ECE (adaptive bins), negative log-likelihood, MSE, accuracy,
+    inverse Brier skill score, and a weighted composite ``ece+inv_bss``
+    (0.2 * inv_bss + 0.8 * ece).
+
+    Args:
+        X_test: Predicted probabilities.
+        y_test: Binary labels (0/1).
+        device: torch.device to perform computations on.
+        verbose: If True, print metrics to stdout.
+        logging: If True, write metrics to ``log_dir``.
+        log_dir: Directory for log files; required when ``logging=True``.
+        eps: Clipping bound for probabilities in NLL / BSS reference.
+
+    Returns:
+        Dict with keys ``ece+inv_bss``, ``ece``, ``inv_bss``, ``nlll``,
+        ``mse``, and ``accuracy`` (scalar floats).
+    """
     if logging and not log_dir:
         raise ValueError("logging=True requires log_dir")
         
@@ -84,7 +104,6 @@ def test_calibration_model(
         "accuracy": accuracy.item(),
     }
     
-# Function to fit the calibration model
 def fit_calibration_model_beta(
     model: nn.Module,
     train: IndexDataset,
@@ -100,6 +119,32 @@ def fit_calibration_model_beta(
     log_dir: Optional[str] = None,
     log_filename: Optional[str] = None,
 ):
+    """
+    Trains a beta-calibration head.
+
+    Optimizes binary cross-entropy between model outputs and ``labels`` from
+    ``train`` batches (``features`` / ``labels`` keys). Uses AdamW with
+    cosine annealing scheduler. Optionally plots train/test loss every ``plot_interval``
+    iterations when ``test`` is provided.
+
+    Args:
+        model: Calibration module mapping features to probabilities.
+        train: Training ``IndexDataset`` with ``features`` and ``labels``.
+        device: torch.device to perform computations on.
+        test: Optional validation set to obtain intermidiate results.
+        lr_max: Initial learning rate for AdamW.
+        lr_min: Minimum learning rate for the cosine scheduler.
+        batch_size: Mini-batch size over ``train``.
+        epochs: Number of passes over the training set.
+        plot_interval: Evaluate and record losses every N optimizer steps.
+        verbose: Show tqdm progress and loss plots.
+        logging: Save loss curve figure to ``log_dir``.
+        log_dir: Output directory for logged results.
+        log_filename: Override auto-generated files names when logging.
+
+    Returns:
+        The trained ``model`` (same object, mutated in place).
+    """
     optimizer = torch.optim.AdamW(model.parameters(), lr_max)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, epochs * (len(train) // batch_size), lr_min
@@ -181,7 +226,6 @@ def fit_calibration_model_beta(
 
     return model
 
-# Function to fit the calibration model
 def fit_calibration_model_temp(
     model: nn.Module,
     train: IndexDataset,
@@ -197,6 +241,31 @@ def fit_calibration_model_temp(
     log_dir: Optional[str] = None,
     log_filename: Optional[str] = None,
 ):
+    """
+    Train a temperature-scaling calibration head on logits.
+
+    Optimizes cross-entropy on temperature-scaled logits against
+    ``answer_tok_ids`` from ``train`` (``logits`` / ``answer_tok_ids`` keys).
+    Training loop and logging mirror ``fit_calibration_model_beta`` function.
+
+    Args:
+        model: Temperature-scaled calibration head.
+        train: Training ``IndexDataset`` with ``logits`` and ``answer_tok_ids``.
+        device: torch.device to perform computations on.
+        test: Optional validation set to obtain intermidiate results.
+        lr_max: Initial learning rate for AdamW.
+        lr_min: Minimum learning rate for the cosine scheduler.
+        batch_size: Mini-batch size over ``train``.
+        epochs: Number of passes over the training set.
+        plot_interval: Evaluate and record losses every N optimizer steps.
+        verbose: Show tqdm progress and loss plots.
+        logging: Save loss curve figure to ``log_dir``.
+        log_dir: Output directory for logged results.
+        log_filename: Override auto-generated files names when logging.
+
+    Returns:
+        The trained ``model`` (same object, mutated in place).
+    """
     optimizer = torch.optim.AdamW(model.parameters(), lr_max)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, epochs * (len(train) // batch_size), lr_min
@@ -277,7 +346,6 @@ def fit_calibration_model_temp(
 
     return model
 
-# Function to find the best hyperparameters for calibration model
 def fit_hparameters_beta(
     model_class: CalibrationHead,
     train: IndexDataset,
@@ -290,6 +358,30 @@ def fit_hparameters_beta(
     logging: bool = False,
     log_dir: Optional[str] = None,
     ):
+    """
+    Random search over training hyperparameters for beta calibration.
+
+    Samples up to ``search_trials`` configs from a grid over learning rates,
+    batch size, and epochs; fits each with ``fit_calibration_model_beta`` and
+    scores on ``test`` and ``test_calibration_model``. Also computes
+    SHAP-like feature attributions per trial.
+
+    Args:
+        model_class: ``CalibrationHead`` subclass to instantiate per trial.
+        train: Training ``IndexDataset``.
+        test: Validation ``IndexDataset``.
+        features_count: Input dimension.
+        device: torch.device to perform computations on.
+        search_trials: Number of hyperparameter combinations to try.
+        random_seed: Seed for shuffling/sampling the grid; None for nondeterministic.
+        verbose: Show trial ECE-diagram and enable nested training verbosity.
+        logging: Log per-trial outputs.
+        log_dir: Root directory; each trial uses ``search_iter_XXX`` subfolders by deafualt.
+
+    Returns:
+        Dict with ``hparameters``, best model ``parameters`` (state dict),
+        ``ece+inv_bss`` and ``shap_values`` from the best trial.
+    """
     param_grid = {
         "lr_max": [1e-2, 5e-3, 2e-3, 1e-3],
         "lr_min": [1e-3, 5e-4, 2e-4, 1e-4],
@@ -409,7 +501,6 @@ def fit_hparameters_beta(
         )
     return best_result
 
-    # Function to find the best hyperparameters for calibration model
 def fit_hparameters_temp(
     model_class: CalibrationHead,
     train: IndexDataset,
@@ -422,6 +513,28 @@ def fit_hparameters_temp(
     logging: bool = False,
     log_dir: Optional[str] = None,
     ):
+    """Random search over training hyperparameters for temperature calibration.
+
+    Same search procedure as ``fit_hparameters_beta``, but uses
+    ``fit_calibration_model_temp`` and evaluates calibrated token probabilities
+    at ``gen_tok_ids`` positions before computing ECE and composite metrics.
+
+    Args:
+        model_class: ``CalibrationHead`` subclass to instantiate per trial.
+        train: Training ``IndexDataset``.
+        test: Validation ``IndexDataset``.
+        features_count: Input dimension.
+        device: torch.device to perform computations on.
+        search_trials: Number of hyperparameter combinations to try.
+        random_seed: Seed for shuffling/sampling the grid; None for nondeterministic.
+        verbose: Show trial ECE-diagram and enable nested training verbosity.
+        logging: Log per-trial outputs.
+        log_dir: Root directory; each trial uses ``search_iter_XXX`` subfolders by deafualt.
+
+    Returns:
+        Dict with ``hparameters``, best model ``parameters`` (state dict),
+        ``ece+inv_bss`` and ``shap_values`` from the best trial.
+    """
     param_grid = {
         "lr_max": [1e-2, 5e-3, 2e-3, 1e-3],
         "lr_min": [1e-3, 5e-4, 2e-4, 1e-4],

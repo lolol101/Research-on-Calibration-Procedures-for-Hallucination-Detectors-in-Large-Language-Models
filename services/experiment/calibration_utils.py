@@ -15,7 +15,6 @@ from ..common.calibration_heads import CalibrationHead
 from ..common.logging_utils import log_data, make_next_indexed_log_filename
 from ..index import IndexDataset
 
-# Function to find indices of best layer and head based on TOHA article
 def find_best_layer_head_hal_dif_power(
     data: dict, 
     layers_count: int, 
@@ -23,6 +22,23 @@ def find_best_layer_head_hal_dif_power(
     best_heads_group_size: int,
     verbose: bool = False
     ):
+    """
+    Selects top attention heads by hallucination–truth score gap (TOHA-style).
+
+    For each (layer, head), computes mean attention score on incorrect minus
+    correct answers, then returns the indices with the largest gaps.
+
+    Args:
+        data: Dict with ``labels`` and ``attn_score{l}_{h}`` tensors per head.
+        layers_count: Number of transformer layers.
+        heads_count: Number of heads per layer.
+        best_heads_group_size: How many (layer, head) pairs to return.
+        verbose: Plot a layer×head heatmap and print the best gap.
+
+    Returns:
+        Tuple ``(best_layers, best_heads)`` index tensors of length
+        ``best_heads_group_size``.
+    """
     hallu_elem_ids = torch.argwhere(data["labels"] == False)
     truth_elem_ids = torch.argwhere(data["labels"] == True)
 
@@ -53,7 +69,6 @@ def find_best_layer_head_hal_dif_power(
     
     return best_score_idx // layers_count, best_score_idx % heads_count
 
-# Function to find indices of best layer and head based on ROC AUC
 def find_best_layer_head_roc_auc(
     data: dict,
     layers_count: int,
@@ -61,6 +76,20 @@ def find_best_layer_head_roc_auc(
     best_heads_group_size: int,
     verbose: bool = False
     ):
+    """
+    Selects top attention heads by ROC AUC separating incorrect answers.
+
+    Args:
+        data: Dict with ``labels`` and ``attn_score{l}_{h}`` tensors per head.
+        layers_count: Number of transformer layers.
+        heads_count: Number of heads per layer.
+        best_heads_group_size: How many (layer, head) pairs to return.
+        verbose: Plot a layer×head heatmap and print the best AUC.
+
+    Returns:
+        Tuple ``(best_layers, best_heads)`` index tensors of length
+        ``best_heads_group_size``.
+    """
     roc_auc_results = torch.stack(
         [
             torch.tensor(calculate_roc_auc(
@@ -97,6 +126,25 @@ def test_calibration_model(
     log_dir: Optional[str] = None,
     eps: float = 1e-8,
 ):
+    """
+    Evaluates calibrated probabilities on a held-out set.
+
+    Same metrics as the baseline helper: ECE, NLL, MSE, accuracy, inverse
+    Brier skill score, and weighted ``ece+inv_bss`` (0.2 BSS + 0.8 ECE).
+
+    Args:
+        X_test: Predicted probabilities.
+        y_test: Binary labels (0/1).
+        device: Device for metric computation.
+        verbose: Print metrics to stdout.
+        logging: Write metrics to ``log_dir``.
+        log_dir: Log directory; required when ``logging=True``.
+        eps: Clipping bound for probabilities in NLL / BSS.
+
+    Returns:
+        Dict with keys ``ece+inv_bss``, ``ece``, ``inv_bss``, ``nlll``,
+        ``mse``, and ``accuracy``.
+    """
     if logging and not log_dir:
         raise ValueError("logging=True requires log_dir")
     
@@ -166,6 +214,19 @@ def _calibration_training_loss(
     l1_lambda: float,
     l2_lambda: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Binary cross-entropy plus optional L1/L2 weight penalties.
+
+    Args:
+        pred: Model predictions.
+        labels: Float targets in [0, 1].
+        model: Module whose parameters are penalized.
+        l1_lambda: L1 coefficient (0 disables).
+        l2_lambda: L2 coefficient (0 disables).
+
+    Returns:
+        Tuple ``(total, bce, l1_loss, l2_loss)`` tensors.
+    """
     bce = torch.nn.functional.binary_cross_entropy(pred, labels)
     l1_loss = bce * 0
     if l1_lambda > 0:
@@ -179,7 +240,6 @@ def _calibration_training_loss(
     return total, bce, l1_loss, l2_loss
 
 
-# Function to fit the calibration model
 def fit_calibration_model(
     model: nn.Module,
     train: IndexDataset,
@@ -198,6 +258,33 @@ def fit_calibration_model(
     l1_lambda: float = 0.0,
     l2_lambda: float = 0.0,
 ):
+    """
+    Trains an experiment calibration head on a feature subset.
+
+    Uses BCE on ``train_batch["features"][:, feature_ids]`` with optional
+    L1/L2 regularization. AdamW + cosine schedule; optional loss curves.
+
+    Args:
+        model: Calibration module.
+        train: Training ``IndexDataset`` with ``features`` and ``labels``.
+        feature_ids: Column indices into the feature matrix.
+        device: Device for tensors and the model.
+        test: Optional validation set for loss logging.
+        lr_max: Initial AdamW learning rate.
+        lr_min: Cosine scheduler floor learning rate.
+        batch_size: Mini-batch size.
+        epochs: Training epochs.
+        plot_interval: Log train/test loss every N steps.
+        verbose: tqdm and matplotlib display.
+        logging: Save loss plot to ``log_dir``.
+        log_dir: Plot output directory.
+        log_filename: Override default filename when logging.
+        l1_lambda: L1 penalty strength on weights.
+        l2_lambda: L2 penalty strength on weights.
+
+    Returns:
+        Trained ``model`` (mutated in place).
+    """
     optimizer = torch.optim.AdamW(model.parameters(), lr_max)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, epochs * (len(train) // batch_size), lr_min
@@ -287,7 +374,6 @@ def fit_calibration_model(
 
     return model
 
-# Function to find the best hyperparameters for calibration model
 def fit_hparameters(
     model_class: CalibrationHead,
     train: IndexDataset,
@@ -305,6 +391,33 @@ def fit_hparameters(
     logging: bool = False,
     log_dir: Optional[str] = None,
     ):
+    """
+    Random search over calibration training hyperparameters.
+
+    Samples trials from a grid (optionally including L1/L2), fits with
+    ``fit_calibration_model``, scores via ECE and ``test_calibration_model``,
+    and records SHAP attributions per trial.
+
+    Args:
+        model_class: ``CalibrationHead`` subclass to instantiate.
+        train: Training ``IndexDataset``.
+        test: Validation ``IndexDataset``.
+        features_count: Per-head feature count before broadcasting.
+        device: Training and metric device.
+        feature_ids: Column subset of ``features``; required at call time.
+        attn_only: If True, input dim uses attention heads only (no +1 final).
+        heads_count: Number of selected attention heads in the input dim.
+        search_trials: Number of grid samples to evaluate.
+        l1_reg: Include L1 penalty values in the search grid.
+        l2_reg: Include L2 penalty values in the search grid.
+        random_seed: RNG seed for shuffling/sampling the grid.
+        verbose: Per-trial training and metric printing.
+        logging: Log trials and best hyperparameters under ``log_dir``.
+
+    Returns:
+        Best trial dict: ``parameters``, ``hparameters``, ``ece+inv_bss``,
+        ``shap_values``.
+    """
     param_grid = {
         "lr_max": [1e-2, 5e-3, 2e-3, 1e-3],
         "lr_min": [1e-3, 5e-4, 2e-4, 1e-4],

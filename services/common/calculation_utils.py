@@ -18,6 +18,26 @@ def calculate_ece_adaptive_bins(
     log_dir: Optional[str] = None,
     log_filename: Optional[str] = None,
 ):
+    """
+    Expected calibration error with equal-count (adaptive) bins.
+
+    Sorts samples by confidence, splits into ``n_bins`` groups of equal size,
+    and sums ``|avg_confidence - accuracy| * proportion``. Optionally plots
+    a reliability diagram.
+
+    Args:
+        token_probs: Predicted probabilities.
+        labels: Binary labels (0/1).
+        device: torch.device to perform computations on.
+        n_bins: Number of adaptive bins.
+        verbose: Show the reliability plot.
+        logging: Save the plot PNG to ``log_dir``.
+        log_dir: Directory for logged figures.
+        log_filename: Override auto-generated PNG name.
+
+    Returns:
+        ECE as a Python float.
+    """
     if logging and not log_dir:
         raise ValueError("logging=True requires log_dir")
 
@@ -120,6 +140,22 @@ def calculate_ece_fixed_bins(
     log_dir: Optional[str] = None,
     log_filename: Optional[str] = None,
 ):
+    """
+    Expected calibration error with uniform-width bins on [0, 1].
+
+    Args:
+        token_probs: Predicted probabilities.
+        labels: Binary labels (0/1).
+        device: Device for masks and ECE accumulation.
+        n_bins: Number of fixed-width bins.
+        verbose: Show the reliability plot.
+        logging: Save the plot PNG to ``log_dir``.
+        log_dir: Directory for logged figures.
+        log_filename: Override auto-generated PNG name.
+
+    Returns:
+        ECE as a Python float.
+    """
     if logging and not log_dir:
         raise ValueError("logging=True requires log_dir")
 
@@ -227,6 +263,20 @@ def calculate_roc_auc(
     log_dir: Optional[str] = None,
     log_filename: Optional[str] = None,
 ):
+    """
+    Area under the ROC curve for binary scores.
+
+    Args:
+        probs: Predicted scores or probabilities.
+        labels: Binary ground-truth labels.
+        verbose: Display the ROC curve.
+        logging: Save the ROC figure to ``log_dir``.
+        log_dir: Directory for logged figures.
+        log_filename: Override auto-generated PNG name.
+
+    Returns:
+        ROC AUC as a Python float.
+    """
     if logging and not log_dir:
         raise ValueError("logging=True requires log_dir")
 
@@ -349,6 +399,15 @@ def calculate_feature_shap_values(
 def calculate_entropy(
     probs: torch.Tensor,
 ):
+    """
+    Shannon entropy along the last dimension of ``probs``.
+
+    Args:
+        probs: Non-negative values in (0, 1], summing to 1 along the last axis.
+
+    Returns:
+        Entropy tensor with shape ``probs.shape[:-1]``.
+    """
     assert torch.all((probs > 0) & (probs <= 1)), (
         f"prob_scores must be in (0, 1] range, but: min={probs.min():.4f}, "
         f"max={probs.max():.4f}, shape={probs.shape}, "
@@ -362,16 +421,38 @@ def calculate_entropy(
     return entropy
 
 def calculate_norm_entropy(token_scores: torch.Tensor):
+    """
+    Entropy normalized by ``log(last_dim_size)`` for the last dimension.
+
+    Args:
+        token_scores: Probability distribution(s).
+
+    Returns:
+        Normalized entropy (same leading shape as input).
+    """
     entropy = calculate_entropy(token_scores)
     norm_attn_entropy = entropy / torch.log(torch.tensor(token_scores.shape[-1]))
     return norm_attn_entropy
 
-# Funtion that calculates features for token series [T, EMB_HEADS_COUNT + (not ATTN_ONLY)] -> [EMB_HEADS_COUNT + (not ATTN_ONLY)]
 def calculate_agg_features(
     t_features: torch.Tensor, # [T, EMB_HEADS_COUNT + (not ATTN_ONLY)]
     early_ratio=0.25, 
     late_ratio=0.75,
     ):
+    """
+    Aggregate a token-time feature matrix into a fixed-length vector.
+
+    Computes mean, std, quantiles, coefficients of variation, and early/late
+    statistics along the time axis (dim 0).
+
+    Args:
+        t_features: Tensor ``[T, F]`` of per-token features.
+        early_ratio: Quantile and slice boundary for the early segment.
+        late_ratio: Quantile and slice start for the late segment.
+
+    Returns:
+        1D tensor of concatenated statistics, length ``7 * F``.
+    """
     t_features = t_features.to(torch.float32)
     
     mean = t_features.mean(0)

@@ -5,6 +5,15 @@ from tqdm import tqdm
 from services.common.calculation_utils import calculate_norm_entropy
 
 def retrieve_answer_token_index(tokens):
+    """
+    Finds the index of the last digit token in a scored sequence.
+
+    Args:
+        tokens: List of per-token score dicts with a ``"token"`` key.
+
+    Returns:
+        Zero-based index of the answer token, or ``None`` if no digit is found.
+    """
     for i in range(len(tokens), 0, -1):
         if tokens[i-1]["token"].isdigit():
             return i - 1
@@ -17,6 +26,23 @@ def process_elements_main(
     attn_only=False,
     verbose=False
     ):
+    """
+    Builds cropped-attention calibration features for the answer token only.
+
+    Stacks normalized attention confidence at selected (layer, head) pairs and
+    optionally appends final-token confidence from top-k probabilities.
+
+    Args:
+        index_data: Inference records with ``score_data`` and ``dataset_elem``.
+        best_layers: Layer indices from head selection, shape ``[K]``.
+        best_heads: Head indices aligned with ``best_layers``.
+        device: Target device for output tensors.
+        attn_only: If True, omit final-token confidence features.
+        verbose: Show tqdm during the feature pass.
+
+    Returns:
+        Dict with ``labels`` ``[B]`` and ``features`` ``[B, K or K+1]``.
+    """
     processed = {}
 
     labels = []
@@ -89,6 +115,22 @@ def process_elements_hal(
     device: torch.device, 
     verbose=False
     ):
+    """
+    Extracts per-(layer, head) attention scores for head selection.
+
+    Used before ``find_best_layer_head_*`` to populate ``attn_score{l}_{h}``
+    keys and binary ``labels``.
+
+    Args:
+        index_data: Inference records with attention entropy fields.
+        layers_count: Number of layers to iterate.
+        heads_count: Number of heads per layer.
+        device: Target device for score tensors.
+        verbose: Show tqdm over layers.
+
+    Returns:
+        Dict with ``labels`` and ``attn_score{l}_{h}`` for each layer/head.
+    """
     processed = {}
     
     # Getting labels of if the answer is correct or not 
@@ -106,7 +148,6 @@ def process_elements_hal(
     processed["labels"] = torch.stack(labels).to(device=device, dtype=torch.long)
    
     attn_entropy = []
-    norm_attn_entropy = []
     for elem in index_data:
         answer_token_index = retrieve_answer_token_index(elem["score_data"])
 
@@ -120,19 +161,14 @@ def process_elements_hal(
         attn_entropy_lh = torch.stack(
             elem["attention_entropy"], dim=0
         ).squeeze(-1).to(device) # [1, L, H]
-        norm_attn_entropy_lh = torch.stack(
-            elem["norm_attention_entropy"], dim=0
-        ).squeeze(-1).to(device) # [1, L, H]
+
         
         attn_entropy.append(
             attn_entropy_lh.index_select(0, captured_ids)
         ) # [B, 1, L, H]
-        norm_attn_entropy.append(
-            norm_attn_entropy_lh.index_select(0, captured_ids)
-        ) # [B, 1, L, H]
+
         
     attn_entropy = torch.stack(attn_entropy, dim=0).squeeze(1) # [B, L, H]
-    norm_attn_entropy = torch.stack(norm_attn_entropy, dim=0).squeeze(1) # [B, L, H]
 
     for l in tqdm(
         range(layers_count),
@@ -141,6 +177,5 @@ def process_elements_hal(
     ):
         for h in range(heads_count):
             processed[f"attn_score{l}_{h}"] = attn_entropy[:, l, h].to(device)
-            processed[f"attn_score{l}_{h}"] = norm_attn_entropy[:, l, h].to(device)
         
     return processed
