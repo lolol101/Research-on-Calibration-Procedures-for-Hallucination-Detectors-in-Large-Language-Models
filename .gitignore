@@ -6,7 +6,6 @@ tasks/tmp
 *.egg-info
 dist
 tasks/tmp
-tmp
 docs
 **/__pycache__/
 **/logs*/
