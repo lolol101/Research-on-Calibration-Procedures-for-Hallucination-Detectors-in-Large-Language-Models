@@ -118,7 +118,7 @@ class Index:
                 except OSError as e:
                     print(f"Error in deleting file {file_path}: {e}")
             else:
-                print(f"Файл не существует: {file_path}")
+                print(f"File does not exist: {file_path}")
         
         self.offsets = []
         self.iterations = []
