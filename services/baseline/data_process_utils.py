@@ -3,6 +3,7 @@ import torch
 from tqdm import tqdm
 
 from services.common.calculation_utils import calculate_norm_entropy
+from services.common.datasets import letter_answer_label
 
 def retrieve_answer_token_index(tokens):
     """
@@ -22,8 +23,9 @@ def retrieve_answer_token_index(tokens):
             return i - 1
 
 def process_elements_main(
-    index_data: np.array, 
-    device: torch.device, 
+    index_data: np.array,
+    device: torch.device,
+    answer_label=letter_answer_label,
     verbose=False
     ):
     """
@@ -36,8 +38,12 @@ def process_elements_main(
 
     Args:
         index_data: Array of dicts with ``score_data`` (token scores) and
-            ``dataset_elem`` (must include ``answer`` as letter in upper register).
+            ``dataset_elem`` (the raw dataset row).
         device: torch.device to perform computations on.
+        answer_label: Callable mapping ``dataset_elem`` to the expected answer
+            token, as a string holding the 0-based option index. Defaults to
+            the letter-encoded convention of MMLU-Pro; pass the matching
+            ``DatasetSpec.answer_label`` for datasets that store an index.
         verbose: If True, show a tqdm progress bar over the feature pass.
 
     Returns:
@@ -60,8 +66,8 @@ def process_elements_main(
             continue            
         
         answer_token = elem["score_data"][answer_token_index]["token"]
-        answer_label = str(ord(elem["dataset_elem"]["answer"]) - ord("A"))
-        labels.append(torch.tensor(answer_token == answer_label))
+        expected_answer = answer_label(elem["dataset_elem"])
+        labels.append(torch.tensor(answer_token == expected_answer))
         gen_tok_ids.append(
             torch.tensor(
                 elem["score_data"][answer_token_index]["top_tokens"] \
@@ -71,7 +77,7 @@ def process_elements_main(
         answer_tok_ids.append(
             torch.tensor(
                 elem["score_data"][answer_token_index]["top_tokens"] \
-                    .index(answer_label)
+                    .index(expected_answer)
             )
         )
     processed["labels"] = torch.stack(labels).to(device=device, dtype=torch.long)

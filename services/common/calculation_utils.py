@@ -6,6 +6,7 @@ from sklearn.metrics import roc_curve, auc
 from pathlib import Path
 from typing import Optional
 from torch import nn
+from tqdm import tqdm
 from .logging_utils import log_data, make_next_indexed_log_filename
 
 def calculate_ece_adaptive_bins(
@@ -254,6 +255,154 @@ def calculate_ece_fixed_bins(
         plt.close(fig)
 
     return ece.item()
+
+def calculate_calibration_metrics(
+    token_probs: torch.Tensor,
+    labels: torch.Tensor,
+    device: torch.device,
+    n_bins: int = 10,
+    eps: float = 1e-8,
+    verbose: bool = False,
+    logging: bool = False,
+    log_dir: Optional[str] = None,
+):
+    """
+    Full set of calibration metrics for one set of predictions.
+
+    Shared by the baseline and experiment ``test_calibration_model`` helpers,
+    and reused by ``calculate_metrics_bootstrap_ci`` on each resample.
+
+    Args:
+        token_probs: Predicted probabilities.
+        labels: Binary labels (0/1).
+        device: torch.device to perform computations on.
+        n_bins: Number of adaptive bins for ECE.
+        eps: Clipping bound for probabilities in NLL / BSS reference.
+        verbose: Show the reliability diagram drawn by the ECE helper.
+        logging: Save that diagram to ``log_dir``.
+        log_dir: Directory for logged figures; required when ``logging=True``.
+
+    Returns:
+        Dict with ``ece+inv_bss``, ``ece``, ``inv_bss``, ``nlll``, ``mse``
+        and ``accuracy`` as Python floats.
+    """
+    if logging and not log_dir:
+        raise ValueError("logging=True requires log_dir")
+
+    ece_value = calculate_ece_adaptive_bins(
+        token_probs,
+        labels,
+        n_bins=n_bins,
+        device=device,
+        verbose=verbose,
+        logging=logging,
+        log_dir=log_dir,
+    )
+
+    probs = token_probs.to(device)
+    labels_f = labels.to(device=device, dtype=torch.float32)
+    probs_clipped = torch.clamp(probs, eps, 1 - eps)
+
+    nlll = torch.nn.functional.binary_cross_entropy(probs_clipped, labels_f)
+    mse = torch.nn.functional.mse_loss(probs, labels_f)
+    accuracy = torch.mean(labels_f)
+
+    p_ref = labels_f.mean()
+    brier_score_ref = torch.mean((p_ref - labels_f) ** 2)
+    inv_brier_skill_score = (
+        (mse / brier_score_ref).item() if brier_score_ref > eps else float("nan")
+    )
+
+    w_bss, w_ece = 0.2, 0.8
+
+    return {
+        "ece+inv_bss": w_bss * inv_brier_skill_score + w_ece * ece_value,
+        "ece": ece_value,
+        "inv_bss": inv_brier_skill_score,
+        "nlll": nlll.item(),
+        "mse": mse.item(),
+        "accuracy": accuracy.item(),
+    }
+
+def calculate_metrics_bootstrap_ci(
+    token_probs: torch.Tensor,
+    labels: torch.Tensor,
+    device: torch.device,
+    n_resamples: int = 1000,
+    confidence: float = 0.95,
+    random_seed: Optional[int] = None,
+    n_bins: int = 10,
+    eps: float = 1e-8,
+    verbose: bool = False,
+):
+    """
+    Percentile bootstrap confidence intervals for the calibration metrics.
+
+    Resamples the evaluation set with replacement ``n_resamples`` times,
+    recomputes every metric on each resample, and reports empirical quantiles.
+    ECE is a biased statistic with an asymmetric sampling distribution, so
+    percentile intervals are preferred over a normal approximation.
+
+    Resamples whose labels are all-zero or all-one make the Brier reference
+    vanish and yield ``nan`` for ``inv_bss``; such draws are dropped per
+    metric rather than propagated.
+
+    Args:
+        token_probs: Predicted probabilities.
+        labels: Binary labels (0/1).
+        device: torch.device to perform computations on.
+        n_resamples: Number of bootstrap resamples.
+        confidence: Two-sided coverage of the reported interval.
+        random_seed: Seed for the resampling RNG; ``None`` leaves it unseeded.
+        n_bins: Number of adaptive bins for ECE.
+        eps: Clipping bound for probabilities in NLL / BSS reference.
+        verbose: Show a tqdm progress bar over resamples.
+
+    Returns:
+        Dict mapping each metric name to a ``(low, high)`` tuple of floats,
+        or ``(nan, nan)`` when every resample produced ``nan``.
+    """
+    n_samples = labels.shape[0]
+    generator = torch.Generator(device="cpu")
+    if random_seed is not None:
+        generator.manual_seed(random_seed)
+
+    collected = {}
+    for _ in tqdm(
+        range(n_resamples),
+        desc="Bootstrapping metrics...",
+        disable=not verbose,
+    ):
+        resample_ids = torch.randint(
+            0, n_samples, (n_samples,), generator=generator
+        ).to(labels.device)
+
+        resample_metrics = calculate_calibration_metrics(
+            token_probs[resample_ids],
+            labels[resample_ids],
+            device=device,
+            n_bins=n_bins,
+            eps=eps,
+        )
+        for name, value in resample_metrics.items():
+            collected.setdefault(name, []).append(value)
+
+    lower_q = (1 - confidence) / 2
+    upper_q = 1 - lower_q
+
+    intervals = {}
+    for name, values in collected.items():
+        samples = torch.tensor(values, dtype=torch.float32)
+        samples = samples[~torch.isnan(samples)]
+        if samples.numel() == 0:
+            intervals[name] = (float("nan"), float("nan"))
+            continue
+        intervals[name] = (
+            torch.quantile(samples, lower_q).item(),
+            torch.quantile(samples, upper_q).item(),
+        )
+
+    return intervals
 
 def calculate_roc_auc(
     probs: torch.Tensor,

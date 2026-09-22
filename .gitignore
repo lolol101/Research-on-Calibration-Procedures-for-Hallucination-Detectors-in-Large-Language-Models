@@ -1,4 +1,6 @@
 index_data
+article_research_hal_llm
+notes
 .vscode
 .ipynb_checkpoints
 .venv
@@ -9,3 +11,4 @@ tasks/tmp
 docs
 **/__pycache__/
 **/logs*/
+CLAUDE.md

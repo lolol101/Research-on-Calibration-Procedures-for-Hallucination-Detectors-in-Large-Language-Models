@@ -10,7 +10,13 @@ import torch
 from torch import nn
 from tqdm import tqdm
 
-from ..common.calculation_utils import calculate_ece_adaptive_bins, calculate_feature_shap_values, calculate_roc_auc
+from ..common.calculation_utils import (
+    calculate_calibration_metrics,
+    calculate_ece_adaptive_bins,
+    calculate_feature_shap_values,
+    calculate_metrics_bootstrap_ci,
+    calculate_roc_auc,
+)
 from ..common.calibration_heads import CalibrationHead
 from ..common.logging_utils import log_data, make_next_indexed_log_filename
 from ..index import IndexDataset
@@ -23,13 +29,18 @@ def test_calibration_model(
     logging: bool = False,
     log_dir: Optional[str] = None,
     eps: float = 1e-8,
+    bootstrap: bool = False,
+    n_resamples: int = 1000,
+    confidence: float = 0.95,
+    random_seed: Optional[int] = None,
 ):
     """
     Calculates set of metrics on the calibrated probabilities.
 
     Computes ECE (adaptive bins), negative log-likelihood, MSE, accuracy,
     inverse Brier skill score, and a weighted composite ``ece+inv_bss``
-    (0.2 * inv_bss + 0.8 * ece).
+    (0.2 * inv_bss + 0.8 * ece). Optionally adds percentile bootstrap
+    confidence intervals for every metric.
 
     Args:
         X_test: Predicted probabilities.
@@ -39,71 +50,66 @@ def test_calibration_model(
         logging: If True, write metrics to ``log_dir``.
         log_dir: Directory for log files; required when ``logging=True``.
         eps: Clipping bound for probabilities in NLL / BSS reference.
+        bootstrap: If True, also report confidence intervals.
+        n_resamples: Number of bootstrap resamples.
+        confidence: Two-sided coverage of the reported intervals.
+        random_seed: Seed for the resampling RNG.
 
     Returns:
         Dict with keys ``ece+inv_bss``, ``ece``, ``inv_bss``, ``nlll``,
-        ``mse``, and ``accuracy`` (scalar floats).
+        ``mse``, and ``accuracy`` (scalar floats), plus ``{metric}_ci_low``
+        and ``{metric}_ci_high`` entries when ``bootstrap=True``.
     """
     if logging and not log_dir:
         raise ValueError("logging=True requires log_dir")
-        
-    ece_value = calculate_ece_adaptive_bins(
+
+    metrics = calculate_calibration_metrics(
         X_test,
         y_test,
-        n_bins=10,
         device=device,
+        eps=eps,
         verbose=verbose,
         logging=logging,
-        log_dir=log_dir
+        log_dir=log_dir,
     )
-    
-    y_test_f = y_test.to(torch.float32)
-    probs_clipped = torch.clamp(X_test, eps, 1 - eps).to(device)
-    nlll = torch.nn.functional.binary_cross_entropy(probs_clipped, y_test_f)
-    mse = torch.nn.functional.mse_loss(X_test, y_test_f)
-    accuracy = torch.mean(y_test_f)
-    
-    p_ref = y_test_f.mean()
-    brier_score_ref = torch.mean((p_ref - y_test_f) ** 2)
-    brier_score = mse
-    inv_brier_skill_score = (brier_score / brier_score_ref).item() if brier_score_ref > eps else float("nan")
-    
-    w_bss, w_ece = 0.2, 0.8
-    ece_bss_weighted = w_bss * inv_brier_skill_score + w_ece * ece_value
-    
+
+    if bootstrap:
+        intervals = calculate_metrics_bootstrap_ci(
+            X_test,
+            y_test,
+            device=device,
+            n_resamples=n_resamples,
+            confidence=confidence,
+            random_seed=random_seed,
+            eps=eps,
+            verbose=verbose,
+        )
+        for name, (low, high) in intervals.items():
+            metrics[f"{name}_ci_low"] = low
+            metrics[f"{name}_ci_high"] = high
+
     if verbose:
-        print(f"ECE+BSS on calibrated answer (test data): {ece_bss_weighted}")
-        print(f"ECE on calibrated answer (test data): {ece_value}")
-        print(f"Inv Brier skill score on test data: {inv_brier_skill_score}")
-        print(f"NLLL (binary cross-entropy) on test data: {nlll.item()}")
-        print(f"MSE on test data: {mse.item()}")
-        print(f"Accuracy  on test: {accuracy.item()}")
-        
+        for name in ("ece+inv_bss", "ece", "inv_bss", "nlll", "mse", "accuracy"):
+            line = f"{name} on test data: {metrics[name]}"
+            if bootstrap:
+                line += (
+                    f"  CI [{metrics[f'{name}_ci_low']:.4f}, "
+                    f"{metrics[f'{name}_ci_high']:.4f}]"
+                )
+            print(line)
+
     if logging:
         log_data(
-            data={
-                "ece+inv_bss": ece_bss_weighted,
-                "ece": ece_value,
-                "inv_bss": inv_brier_skill_score,
-                "nlll": nlll.item(),
-                "mse": mse.item(),
-                "accuracy": accuracy.item(),
-            },
+            data=metrics,
             log_dir=log_dir,
             prefix="calibration_metrics",
             extension=".txt",
             separator="=",
         )
-            
-    return {
-        "ece+inv_bss": ece_bss_weighted,
-        "ece": ece_value,
-        "inv_bss": inv_brier_skill_score,
-        "nlll": nlll.item(),
-        "mse": mse.item(),
-        "accuracy": accuracy.item(),
-    }
-    
+
+    return metrics
+
+
 def fit_calibration_model_beta(
     model: nn.Module,
     train: IndexDataset,

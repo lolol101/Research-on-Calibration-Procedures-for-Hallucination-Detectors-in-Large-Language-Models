@@ -6,6 +6,7 @@ from services.common.calculation_utils import (
     calculate_norm_entropy,
     calculate_agg_features,
 )
+from services.common.datasets import letter_answer_label
 
 def retrieve_answer_token_index(tokens):
     """
@@ -54,8 +55,9 @@ def process_elements_main(
     index_data: np.array, 
     best_layers: torch.Tensor, 
     best_heads: torch.Tensor,
-    device: torch.device, 
+    device: torch.device,
     attn_only=False,
+    answer_label=letter_answer_label,
     verbose=False
     ):
     """
@@ -70,6 +72,9 @@ def process_elements_main(
         best_heads: Selected head indices aligned with ``best_layers``.
         device: Target device for tensors.
         attn_only: If True, use attention confidences only (no final-token dim).
+        answer_label: Callable mapping ``dataset_elem`` to the expected answer
+            token, as a string holding the 0-based option index. Defaults to
+            the letter-encoded convention of MMLU-Pro.
         verbose: Show tqdm during processing.
 
     Returns:
@@ -86,8 +91,8 @@ def process_elements_main(
             continue   
                  
         answer_token = elem["score_data"][answer_token_index]["token"]
-        answer_label = str(ord(elem["dataset_elem"]["answer"]) - ord("A"))
-        labels.append(torch.tensor(answer_token == answer_label))
+        expected_answer = answer_label(elem["dataset_elem"])
+        labels.append(torch.tensor(answer_token == expected_answer))
     processed["labels"] = torch.stack(labels).to(device=device, dtype=torch.long)
 
     best_layers = best_layers.reshape(-1).to(device)
@@ -154,9 +159,10 @@ def process_elements_main(
 
 def process_elements_hal(
     index_data: np.array, 
-    layers_count: int, 
-    heads_count: int, 
-    device: torch.device, 
+    layers_count: int,
+    heads_count: int,
+    device: torch.device,
+    answer_label=letter_answer_label,
     verbose=False
     ):
     """
@@ -169,6 +175,9 @@ def process_elements_hal(
         layers_count: Number of transformer layers.
         heads_count: Number of heads per layer.
         device: Target device for tensors.
+        answer_label: Callable mapping ``dataset_elem`` to the expected answer
+            token, as a string holding the 0-based option index. Defaults to
+            the letter-encoded convention of MMLU-Pro.
         verbose: Show tqdm over layers.
 
     Returns:
@@ -186,8 +195,8 @@ def process_elements_hal(
             continue   
                  
         answer_token = elem["score_data"][answer_token_index]["token"]
-        answer_label = str(ord(elem["dataset_elem"]["answer"]) - ord("A"))
-        labels.append(torch.tensor(answer_token == answer_label))
+        expected_answer = answer_label(elem["dataset_elem"])
+        labels.append(torch.tensor(answer_token == expected_answer))
     processed["labels"] = torch.stack(labels).to(device=device, dtype=torch.long)
    
     attn_entropy = []
