@@ -18,6 +18,7 @@ model rejected more often is effectively evaluated on a different subset.
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from services.common.datasets import COT_REGIME, REGIMES, DATASETS, get_dataset
+from services.common.logging_utils import log_data
 
 
 def parse_args():
@@ -81,6 +83,12 @@ def parse_args():
         type=int,
         default=500,
         help="Generations to retry per row before giving up (default: 500).",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=25,
+        help="Rows between progress-file updates (default: 25).",
     )
     parser.add_argument(
         "--overwrite",
@@ -161,6 +169,29 @@ def resolve_start_row(index, args):
     )
 
 
+def log_progress(log_dir, index_name, stats):
+    """Rewrite ``<index_name>_progress.txt`` with the current collection state.
+
+    The file carries the same ``key=value`` fields as the final summary and is
+    overwritten in place, so a running collection can be followed from another
+    shell once the terminal that started it is gone.
+
+    Args:
+        log_dir: Directory holding the index files.
+        index_name: Index base name the progress file is named after.
+        stats: Mapping of progress field names to values.
+
+    Returns:
+        Absolute path to the written file.
+    """
+    return log_data(
+        data=stats,
+        log_dir=log_dir,
+        log_filename=f"{index_name}_progress.txt",
+        separator="=",
+    )
+
+
 def main():
     """Run one collection: load the model, generate, and fill the index."""
     args = parse_args()
@@ -230,6 +261,8 @@ def main():
     correct_count = 0
     discarded_count = 0
     abandoned_rows = []
+    attempted_rows = row_count - start_row
+    start_time = time.monotonic()
 
     progress_bar = tqdm(
         range(start_row, row_count),
@@ -277,7 +310,35 @@ def main():
                 abandoned_rows.append(row_id)
                 print(f"Row {row_id}: error limit reached, skipping.")
 
-    attempted_rows = row_count - start_row
+        rows_done = row_id - start_row + 1
+        if rows_done % args.progress_every == 0 or rows_done == attempted_rows:
+            elapsed = time.monotonic() - start_time
+            rows_per_second = rows_done / elapsed if elapsed else 0.0
+            log_progress(
+                log_dir=args.output_dir,
+                index_name=index_name,
+                stats={
+                    "rows_done": rows_done,
+                    "rows_total": attempted_rows,
+                    "current_row": row_id,
+                    "rows_accepted": accepted_count,
+                    "rows_abandoned": len(abandoned_rows),
+                    "generations_discarded": discarded_count,
+                    "accuracy": (
+                        correct_count / accepted_count
+                        if accepted_count
+                        else float("nan")
+                    ),
+                    "acceptance_rate": accepted_count / rows_done,
+                    "elapsed_seconds": round(elapsed, 1),
+                    "eta_seconds": (
+                        round((attempted_rows - rows_done) / rows_per_second, 1)
+                        if rows_per_second
+                        else float("nan")
+                    ),
+                },
+            )
+
     summary = {
         "model": args.model,
         "dataset": spec.name,

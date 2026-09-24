@@ -15,6 +15,14 @@ not the stray trailing whitespace: nothing has been collected with them yet.
 ``input_options`` is passed to the prompt template as a list, so it is rendered
 with Python list syntax. This matches the collected MMLU-Pro data and is kept
 for that reason.
+
+The RACE prompts are derived from the MMLU-Pro ones rather than written out
+again: the RACE launch notebooks used byte-identical text, differing only in
+the number of answer options. Deriving them keeps that identity explicit and
+keeps the two prompt sets from drifting apart. RACE adds a passage block on
+top, which the notebooks did not have -- they asked RACE questions without the
+article, so data collected with this spec is not comparable to the indices the
+notebooks produced.
 """
 
 from dataclasses import dataclass
@@ -119,6 +127,29 @@ MMLU_PRO_COT_USER_PROMPT = (
     "            {input_options}\n"
     "            "
 )
+
+# RACE asks the same kind of question as MMLU-Pro over four options instead of
+# ten, and its launch notebooks reused the MMLU-Pro prompts verbatim with that
+# one substitution. The replacements below reproduce exactly that text.
+
+RACE_CROPPED_SYSTEM_PROMPT = MMLU_PRO_CROPPED_SYSTEM_PROMPT.replace(
+    "0 and 9", "0 and 3"
+)
+
+RACE_COT_SYSTEM_PROMPT = MMLU_PRO_COT_SYSTEM_PROMPT.replace("0 and 9", "0 and 3")
+
+# The passage the notebooks never supplied. It is prepended to the unchanged
+# MMLU-Pro user prompts, so the open-book and closed-book RACE conditions
+# differ by this block alone.
+RACE_PASSAGE_BLOCK = """
+            Passage:
+            {input_context}
+"""
+
+RACE_CROPPED_USER_PROMPT = RACE_PASSAGE_BLOCK + MMLU_PRO_CROPPED_USER_PROMPT
+
+RACE_COT_USER_PROMPT = RACE_PASSAGE_BLOCK + MMLU_PRO_COT_USER_PROMPT
+
 
 COSMOS_QA_CROPPED_SYSTEM_PROMPT = """
             You are an expert at answering multiple choice questions about a passage.
@@ -270,6 +301,15 @@ def _hellaswag_inputs(dataset_elem: dict) -> dict:
     }
 
 
+def _race_inputs(dataset_elem: dict) -> dict:
+    """Prompt placeholders for one RACE row, including its article."""
+    return {
+        "input_context": dataset_elem["article"],
+        "input_question": dataset_elem["question"],
+        "input_options": _format_options(dataset_elem["options"]),
+    }
+
+
 @dataclass(frozen=True)
 class DatasetSpec:
     """Everything that differs between benchmarks in one place.
@@ -316,6 +356,24 @@ MMLU_PRO = DatasetSpec(
     answer_label=letter_answer_label,
 )
 
+RACE = DatasetSpec(
+    name="race",
+    hf_path="ehovy/race",
+    hf_config="high",
+    hf_split="train",
+    option_count=4,
+    system_prompt={
+        CROPPED_REGIME: RACE_CROPPED_SYSTEM_PROMPT,
+        COT_REGIME: RACE_COT_SYSTEM_PROMPT,
+    },
+    user_prompt={
+        CROPPED_REGIME: RACE_CROPPED_USER_PROMPT,
+        COT_REGIME: RACE_COT_USER_PROMPT,
+    },
+    build_inputs=_race_inputs,
+    answer_label=letter_answer_label,
+)
+
 # CosmosQA is loaded from a Parquet mirror rather than "allenai/cosmos_qa":
 # the canonical repository ships a Python loading script, and datasets>=4.0
 # refuses those outright. The mirror carries identical fields and split sizes
@@ -357,7 +415,7 @@ HELLASWAG = DatasetSpec(
 )
 
 DATASETS: Dict[str, DatasetSpec] = {
-    spec.name: spec for spec in (MMLU_PRO, COSMOS_QA, HELLASWAG)
+    spec.name: spec for spec in (MMLU_PRO, RACE, COSMOS_QA, HELLASWAG)
 }
 
 
