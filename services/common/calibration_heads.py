@@ -121,11 +121,12 @@ class MLPBetaCalibrationHead(CalibrationHead):
 class TemperatureCalibrationHead(CalibrationHead):
     """Calibration via scaling logits by learable parameter in softmax procedure"""
 
-    def __init__(self, device: torch.device, init_temperature: float = 1.0, eps: float = 1e-6):
+    def __init__(self, in_features: int, device: torch.device, init_temperature: float = 1.0, eps: float = 1e-6):
         """
         Create a scalar temperature parameter.
 
         Args:
+            in_features: Unused; kept for interface compatibility.
             device: torch.device to perform computations on.
             init_temperature: Initial temperature value (> 0).
             eps: Clamping parameter.

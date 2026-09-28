@@ -135,13 +135,15 @@ def process_elements_main(
             reasoning_scores = best_heads_norm_attn_confidence[:-1] # [T - 1, BEST_H + (not ATTN_ONLY)]
             answer_scores = best_heads_norm_attn_confidence[-1] # [1, BEST_H + (not ATTN_ONLY)]
         else:
+            # The final-token score leads every block, as in the cropped
+            # regime: head-count subsets take the leading columns of a block.
             reasoning_scores = torch.cat([
-                best_heads_norm_attn_confidence,
                 final_token_scores.unsqueeze(-1),
+                best_heads_norm_attn_confidence,
             ], dim=1).to(device)[:-1] # [T - 1, BEST_H + (not ATTN_ONLY)]
             answer_scores = torch.cat([
-                best_heads_norm_attn_confidence,
                 final_token_scores.unsqueeze(-1),
+                best_heads_norm_attn_confidence,
             ], dim=1).to(device)[-1] # [1, BEST_H + (not ATTN_ONLY)]
         
         elem_features.append(
