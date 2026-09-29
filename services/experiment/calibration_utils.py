@@ -21,7 +21,7 @@ from ..common.calibration_heads import CalibrationHead
 from ..common.logging_utils import log_data, make_next_indexed_log_filename
 from ..index import IndexDataset
 
-def find_best_layer_head_hal_dif_power(
+def find_best_layer_head_hdp(
     data: dict, 
     layers_count: int, 
     heads_count: int, 
@@ -48,7 +48,7 @@ def find_best_layer_head_hal_dif_power(
     hallu_elem_ids = torch.argwhere(data["labels"] == False)
     truth_elem_ids = torch.argwhere(data["labels"] == True)
 
-    hal_dif_power_results = torch.stack(
+    hdp_results = torch.stack(
         [
             data[f"attn_score{l}_{h}"][hallu_elem_ids].mean() - data[f"attn_score{l}_{h}"][truth_elem_ids].mean()
             for l in range(layers_count)
@@ -56,22 +56,22 @@ def find_best_layer_head_hal_dif_power(
         ]
     )
     
-    hal_dif_power_matrix = hal_dif_power_results \
+    hdp_matrix = hdp_results \
         .reshape(layers_count, heads_count) \
         .cpu() \
         .to(dtype=torch.float32)
 
-    best_score_idx = torch.argsort(hal_dif_power_results, descending=True)[:best_heads_group_size]
+    best_score_idx = torch.argsort(hdp_results, descending=True)[:best_heads_group_size]
     
     if verbose:
         plt.figure(figsize=(5, 4))
-        sns.heatmap(hal_dif_power_matrix, annot=False, cmap="Reds")
+        sns.heatmap(hdp_matrix, annot=False, cmap="Reds")
         plt.title("Hallucination difference power values by Layer and Head")
         plt.xlabel("Head ID")
         plt.ylabel("Layer ID")
         plt.gca().invert_yaxis()
         plt.show()
-        print(f"Best metric value: {torch.max(hal_dif_power_results).item()}")
+        print(f"Best metric value: {torch.max(hdp_results).item()}")
     
     return best_score_idx // heads_count, best_score_idx % heads_count
 

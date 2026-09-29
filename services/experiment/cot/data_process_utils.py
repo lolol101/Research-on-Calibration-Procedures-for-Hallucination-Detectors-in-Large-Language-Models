@@ -159,7 +159,7 @@ def process_elements_main(
     
     return processed
 
-def process_elements_hal(
+def process_elements_hdp(
     index_data: np.array, 
     layers_count: int,
     heads_count: int,
@@ -170,7 +170,7 @@ def process_elements_hal(
     """
     Extracts per-(layer, head) attention scores at the answer token for head search.
 
-    Same output layout as the cropped ``process_elements_hal`` helper.
+    Same output layout as the cropped ``process_elements_hdp`` helper.
 
     Args:
         index_data: Inference records with attention entropy fields.

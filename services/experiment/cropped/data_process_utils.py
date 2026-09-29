@@ -113,7 +113,7 @@ def process_elements_main(
     
     return processed
 
-def process_elements_hal(
+def process_elements_hdp(
     index_data: np.array, 
     layers_count: int,
     heads_count: int,

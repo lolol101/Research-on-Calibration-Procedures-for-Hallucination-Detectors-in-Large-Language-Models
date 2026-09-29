@@ -13,7 +13,7 @@ from ..common.datasets import COT_REGIME, CROPPED_REGIME, letter_answer_label
 from ..common.logging_utils import log_data
 from ..index import Index, IndexDataset
 from .calibration_utils import (
-    find_best_layer_head_hal_dif_power,
+    find_best_layer_head_hdp,
     find_best_layer_head_roc_auc,
     fit_hparameters,
     test_calibration_model,
@@ -34,7 +34,7 @@ FEATURES_COUNT = {
 }
 
 HEAD_SELECTORS = {
-    "hal": find_best_layer_head_hal_dif_power,
+    "hdp": find_best_layer_head_hdp,
     "roc-auc": find_best_layer_head_roc_auc,
 }
 
@@ -93,7 +93,7 @@ def select_heads(
     head_selection_dataset = IndexDataset(
         index=index,
         process_elements=partial(
-            PROCESSING[regime].process_elements_hal,
+            PROCESSING[regime].process_elements_hdp,
             layers_count=layers_count,
             heads_count=heads_count,
             answer_label=answer_label,
