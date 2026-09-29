@@ -1,14 +1,14 @@
 """Train and evaluate calibration heads on a collected ``Index``.
 
-Command-line equivalent of the notebooks under ``tasks/baseline_calibrations/``
-and ``tasks/experiment_calibrations/``, parameterised by model, dataset,
+Command-line equivalent of the notebooks under ``legacy/baseline_calibrations/``
+and ``legacy/experiment_calibrations/``, parameterised by model, dataset,
 response regime and method, so that several runs can go side by side, one
 process per GPU::
 
-    python tasks/calibrations/calibrate.py --model Qwen/Qwen3-4B \\
+    python tasks/calibrate.py --model Qwen/Qwen3-4B \\
         --dataset hellaswag --regime cot --method experiment --gpu 0
 
-The index is located by the name ``tasks/launches/launch.py`` gives it, or
+The index is located by the name ``tasks/launch.py`` gives it, or
 passed explicitly with ``--index-name``. The number of layers and heads is
 read from the stored records, so a new model needs no extra configuration.
 
@@ -23,7 +23,7 @@ import os
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

@@ -1,10 +1,10 @@
 """Collect model responses and per-token scores into an ``Index``.
 
-Command-line equivalent of the per-model launch notebooks in this directory,
+Command-line equivalent of the per-model launch notebooks under ``legacy/launches/``,
 parameterised by model, dataset and response regime so that several
 collections can run side by side, one process per GPU::
 
-    python tasks/launches/launch.py --model Qwen/Qwen3-4B \\
+    python tasks/launch.py --model Qwen/Qwen3-4B \\
         --dataset hellaswag --regime cot --gpu 0
 
 Records are written in exactly the layout the notebooks produce, so data
@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

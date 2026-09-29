@@ -137,7 +137,7 @@ def run_experiment_calibrations(
     """
     Runs head selection and attention-based calibration on one index.
 
-    Mirrors the notebooks under ``tasks/experiment_calibrations/``: for every
+    Mirrors the notebooks under ``legacy/experiment_calibrations/``: for every
     head-selection criterion and calibration head, fits on the train split,
     chooses hyperparameters on the val split, and evaluates on the test split
     once per number of selected heads.

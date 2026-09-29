@@ -5,8 +5,8 @@ benchmark means adding one entry to :data:`DATASETS` rather than editing the
 data-processing helpers.
 
 The MMLU-Pro prompts reproduce, byte for byte, the ones used by the original
-launch notebooks under ``tasks/launches/``: responses collected by
-``tasks/launches/launch.py`` must stay comparable with the data already stored
+launch notebooks under ``legacy/launches/``: responses collected by
+``tasks/launch.py`` must stay comparable with the data already stored
 in ``index_data/``. Their indentation and trailing spaces come from the
 triple-quoted literals in those notebooks and are kept deliberately, since they
 change tokenization. The CosmosQA and HellaSwag prompts share the layout but

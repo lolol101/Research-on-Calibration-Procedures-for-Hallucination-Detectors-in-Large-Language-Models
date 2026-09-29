@@ -30,7 +30,7 @@ def run_baseline_calibrations(
     """
     Evaluates the uncalibrated, beta and temperature baselines on one index.
 
-    Mirrors the notebooks under ``tasks/baseline_calibrations/``: the heads are
+    Mirrors the notebooks under ``legacy/baseline_calibrations/``: the heads are
     fitted on the train split, hyperparameters are chosen on the val split, and
     the best model is evaluated on the test split.
 
