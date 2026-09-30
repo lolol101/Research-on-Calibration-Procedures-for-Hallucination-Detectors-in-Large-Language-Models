@@ -16,11 +16,18 @@ Logs follow the notebook layout under
 ``<logs-dir>/<index_name>/<method>/...``; for ``experiment`` the path also
 carries the regularisation, the head-selection sample size and the feature
 mode, e.g. ``logs_l1_hs_50/attn_plus_final/``.
+
+A run that finishes writes ``completed.txt`` into its log directory. With
+``--skip-done`` such a run is skipped, and the log directory of an interrupted
+run is removed before the run starts over, so a queue can be resumed after a
+crash without mixing partial and fresh logs.
 """
 
 import argparse
 import os
+import shutil
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,8 +35,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from services.common.datasets import DATASETS, REGIMES, get_dataset
+from services.common.logging_utils import log_data
 
 METHODS = ("baseline", "experiment")
+COMPLETION_MARKER = "completed.txt"
 
 
 def parse_args():
@@ -107,6 +116,11 @@ def parse_args():
         "--verbose",
         action="store_true",
         help="Show data loading progress and print test metrics.",
+    )
+    parser.add_argument(
+        "--skip-done",
+        action="store_true",
+        help="Skip the run if it already completed; remove the logs of an interrupted run and start over.",
     )
 
     experiment = parser.add_argument_group("experiment method")
@@ -192,11 +206,21 @@ def main():
         raise SystemExit(f"Index {index_name!r} in {args.index_dir} holds no records.")
     print(f"Index: {index_name} ({len(index)} records)")
 
+    log_dir = os.path.join(args.logs_dir, index_name, args.method)
+    if args.method == "experiment":
+        log_dir = os.path.join(log_dir, experiment_log_subdir(args))
+
+    if args.skip_done:
+        if os.path.exists(os.path.join(log_dir, COMPLETION_MARKER)):
+            print(f"Already completed, skipped: {log_dir}")
+            return
+        if os.path.isdir(log_dir):
+            shutil.rmtree(log_dir)
+            print(f"Removed logs of an interrupted run: {log_dir}")
+
     # Built on the first run over this index, read by every later one.
     cache = FeatureCache(index, args.regime, answer_label=spec.answer_label, verbose=args.verbose)
     print(f"Features: {cache.path}")
-
-    log_dir = os.path.join(args.logs_dir, index_name, args.method)
 
     if args.method == "baseline":
         run_baseline_calibrations(
@@ -211,7 +235,6 @@ def main():
             log_dir=log_dir,
         )
     else:
-        log_dir = os.path.join(log_dir, experiment_log_subdir(args))
         run_experiment_calibrations(
             cache=cache,
             regime=args.regime,
@@ -231,6 +254,11 @@ def main():
             log_dir=log_dir,
         )
 
+    log_data(
+        data={"finished": time.strftime("%Y-%m-%d %H:%M:%S")},
+        log_dir=log_dir,
+        log_filename=COMPLETION_MARKER,
+    )
     print(f"Logs: {log_dir}")
 
 
