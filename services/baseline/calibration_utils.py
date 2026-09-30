@@ -2,7 +2,6 @@ import os
 from pathlib import Path
 from typing import Literal, Optional
 
-from matplotlib import pyplot as plt
 import numpy as np
 import seaborn as sns
 from sklearn.model_selection import ParameterGrid
@@ -18,7 +17,8 @@ from ..common.calculation_utils import (
     calculate_roc_auc,
 )
 from ..common.calibration_heads import CalibrationHead
-from ..common.logging_utils import log_data, make_next_indexed_log_filename
+from ..common.training_utils import fit_with_early_stopping
+from ..common.logging_utils import log_data
 from ..index import IndexDataset
 
 def test_calibration_model(
@@ -114,12 +114,13 @@ def fit_calibration_model_beta(
     model: nn.Module,
     train: IndexDataset,
     device: torch.device,
-    test: Optional[IndexDataset] = None,
+    test: IndexDataset,
     lr_max=1e-2,
     lr_min=1e-4,
     batch_size=64,
-    epochs=3,
-    plot_interval=3,
+    max_epochs=20,
+    patience=3,
+    shuffle_seed: Optional[int] = None,
     verbose: bool = False,
     logging: bool = False,
     log_dir: Optional[str] = None,
@@ -128,120 +129,67 @@ def fit_calibration_model_beta(
     """
     Trains a beta-calibration head.
 
-    Optimizes binary cross-entropy between model outputs and ``labels`` from
-    ``train`` batches (``features`` / ``labels`` keys). Uses AdamW with
-    cosine annealing scheduler. Optionally plots train/test loss every ``plot_interval``
-    iterations when ``test`` is provided.
+    Optimizes binary cross-entropy between model outputs on ``features`` and
+    ``labels``, stopping early on the validation loss (see
+    ``fit_with_early_stopping``).
 
     Args:
         model: Calibration module mapping features to probabilities.
         train: Training ``IndexDataset`` with ``features`` and ``labels``.
         device: torch.device to perform computations on.
-        test: Optional validation set to obtain intermidiate results.
+        test: Validation ``IndexDataset`` used for early stopping.
         lr_max: Initial learning rate for AdamW.
         lr_min: Minimum learning rate for the cosine scheduler.
         batch_size: Mini-batch size over ``train``.
-        epochs: Number of passes over the training set.
-        plot_interval: Evaluate and record losses every N optimizer steps.
-        verbose: Show tqdm progress and loss plots.
-        logging: Save loss curve figure to ``log_dir``.
+        max_epochs: Upper bound on the number of passes over ``train``.
+        patience: Epochs without validation improvement before stopping.
+        shuffle_seed: Seed for the per-epoch batch order.
+        verbose: Show tqdm progress and the loss plot.
+        logging: Save the loss plot to ``log_dir``.
         log_dir: Output directory for logged results.
         log_filename: Override auto-generated files names when logging.
 
     Returns:
-        The trained ``model`` (same object, mutated in place).
+        Tuple ``(model, best_epoch)``: the trained ``model`` (mutated in
+        place) and the epoch whose weights it holds.
     """
-    optimizer = torch.optim.AdamW(model.parameters(), lr_max)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, epochs * (len(train) // batch_size), lr_min
+    train_data, val_data = train.get(), test.get()
+
+    def loss_fn(model, features, labels):
+        loss = torch.nn.functional.binary_cross_entropy(model(features), labels)
+        return loss, loss
+
+    best_epoch = fit_with_early_stopping(
+        model,
+        train_data["features"].to(device=device, dtype=torch.float32),
+        train_data["labels"].to(device=device, dtype=torch.float32),
+        val_data["features"].to(device=device, dtype=torch.float32),
+        val_data["labels"].to(device=device, dtype=torch.float32),
+        loss_fn,
+        lr_max=lr_max,
+        lr_min=lr_min,
+        batch_size=batch_size,
+        max_epochs=max_epochs,
+        patience=patience,
+        shuffle_seed=shuffle_seed,
+        verbose=verbose,
+        logging=logging,
+        log_dir=log_dir,
+        log_filename=log_filename,
     )
-
-    train_losses = []
-    test_losses = []
-    iterations = []
-    
-    iteration_counter = 0
-    for _ in tqdm(range(epochs), desc="Training (epochs)...", disable=not verbose):
-        for start in range(0, len(train), batch_size):
-            train_batch = train.get(start, min(start + batch_size, len(train)))
-            if not train_batch:
-                continue
-
-            optimizer.zero_grad()
-
-            train_batch_features = train_batch["features"].to(device=device, dtype=torch.float32)
-            train_cal_confidence = model(train_batch_features)
-
-            train_batch_labels = train_batch["labels"].to(device=device, dtype=torch.float32)
-            
-            train_loss = torch.nn.functional.binary_cross_entropy(
-                train_cal_confidence,
-                train_batch_labels
-            )
-
-            train_loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            if (
-                test is not None
-                and iteration_counter % plot_interval == 0
-            ):
-                train_loss = train_loss.item()
-                train_losses.append(train_loss)
-
-                test_data = test.get()
-                if test_data:
-                    test_batch_features = test_data["features"].to(device=device, dtype=torch.float32)
-                    test_batch_labels = test_data["labels"].to(device=device, dtype=torch.float32)
-                    
-                    with torch.no_grad():
-                        test_cal_confidence = model(test_batch_features)
-                        test_loss = torch.nn.functional.binary_cross_entropy(
-                            test_cal_confidence,
-                            test_batch_labels
-                        )
-                        test_losses.append(test_loss.item())
-                    
-                    iterations.append(iteration_counter)
-            iteration_counter += 1
-
-    if len(iterations) > 0 and (verbose or logging):
-        fig, ax = plt.subplots(figsize=(4, 4))
-        ax.plot(iterations, train_losses, label="Train Loss", marker="o")
-        if len(test_losses) > 0:
-            ax.plot(iterations, test_losses, label="Test Loss", marker="s")
-        ax.set_xlabel("Iteration")
-        ax.set_ylabel("Loss")
-        ax.set_title("Training and Test Loss over Iterations")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        if logging:
-            Path(log_dir).mkdir(parents=True, exist_ok=True)
-            fname = log_filename or make_next_indexed_log_filename(
-                log_dir=log_dir,
-                prefix="calibration_fit_loss",
-                extension=".png",
-            )
-            out_path = os.path.join(log_dir, fname)
-            fig.savefig(out_path, dpi=200, bbox_inches="tight")
-        if verbose:
-            plt.show()
-        plt.close(fig)
-
-    return model
+    return model, best_epoch
 
 def fit_calibration_model_temp(
     model: nn.Module,
     train: IndexDataset,
     device: torch.device,
-    test: Optional[IndexDataset] = None,
+    test: IndexDataset,
     lr_max=1e-2,
     lr_min=1e-4,
     batch_size=64,
-    epochs=3,
-    plot_interval=3,
+    max_epochs=20,
+    patience=3,
+    shuffle_seed: Optional[int] = None,
     verbose: bool = False,
     logging: bool = False,
     log_dir: Optional[str] = None,
@@ -250,107 +198,55 @@ def fit_calibration_model_temp(
     """
     Train a temperature-scaling calibration head on logits.
 
-    Optimizes cross-entropy on temperature-scaled logits against
-    ``answer_tok_ids`` from ``train`` (``logits`` / ``answer_tok_ids`` keys).
-    Training loop and logging mirror ``fit_calibration_model_beta`` function.
+    Optimizes cross-entropy on temperature-scaled ``logits`` against
+    ``answer_tok_ids``, stopping early on the validation loss (see
+    ``fit_with_early_stopping``).
 
     Args:
         model: Temperature-scaled calibration head.
         train: Training ``IndexDataset`` with ``logits`` and ``answer_tok_ids``.
         device: torch.device to perform computations on.
-        test: Optional validation set to obtain intermidiate results.
+        test: Validation ``IndexDataset`` used for early stopping.
         lr_max: Initial learning rate for AdamW.
         lr_min: Minimum learning rate for the cosine scheduler.
         batch_size: Mini-batch size over ``train``.
-        epochs: Number of passes over the training set.
-        plot_interval: Evaluate and record losses every N optimizer steps.
-        verbose: Show tqdm progress and loss plots.
-        logging: Save loss curve figure to ``log_dir``.
+        max_epochs: Upper bound on the number of passes over ``train``.
+        patience: Epochs without validation improvement before stopping.
+        shuffle_seed: Seed for the per-epoch batch order.
+        verbose: Show tqdm progress and the loss plot.
+        logging: Save the loss plot to ``log_dir``.
         log_dir: Output directory for logged results.
         log_filename: Override auto-generated files names when logging.
 
     Returns:
-        The trained ``model`` (same object, mutated in place).
+        Tuple ``(model, best_epoch)``: the trained ``model`` (mutated in
+        place) and the epoch whose weights it holds.
     """
-    optimizer = torch.optim.AdamW(model.parameters(), lr_max)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, epochs * (len(train) // batch_size), lr_min
+    train_data, val_data = train.get(), test.get()
+
+    def loss_fn(model, logits, answer_tok_ids):
+        loss = torch.nn.functional.cross_entropy(model.scale_logits(logits), answer_tok_ids)
+        return loss, loss
+
+    best_epoch = fit_with_early_stopping(
+        model,
+        train_data["logits"].to(device=device, dtype=torch.float32),
+        train_data["answer_tok_ids"].to(device=device, dtype=torch.long),
+        val_data["logits"].to(device=device, dtype=torch.float32),
+        val_data["answer_tok_ids"].to(device=device, dtype=torch.long),
+        loss_fn,
+        lr_max=lr_max,
+        lr_min=lr_min,
+        batch_size=batch_size,
+        max_epochs=max_epochs,
+        patience=patience,
+        shuffle_seed=shuffle_seed,
+        verbose=verbose,
+        logging=logging,
+        log_dir=log_dir,
+        log_filename=log_filename,
     )
-
-    train_losses = []
-    test_losses = []
-    iterations = []
-    
-    iteration_counter = 0
-    for _ in tqdm(range(epochs), desc="Training (epochs)...", disable=not verbose):
-        for start in range(0, len(train), batch_size):
-            train_batch = train.get(start, min(start + batch_size, len(train)))
-            if not train_batch:
-                continue
-
-            optimizer.zero_grad()
-
-            train_batch_features = train_batch["logits"].to(device=device, dtype=torch.float32)
-            train_cal_confidence = model.scale_logits(train_batch_features)
-            train_batch_labels = train_batch["answer_tok_ids"].to(device=device, dtype=torch.long)
-            
-            train_loss = torch.nn.functional.cross_entropy(
-                train_cal_confidence,
-                train_batch_labels
-            )
-
-            train_loss.backward()
-            optimizer.step()
-            scheduler.step()
-
-            if (
-                test is not None
-                and iteration_counter % plot_interval == 0
-            ):
-                train_loss = train_loss.item()
-                train_losses.append(train_loss)
-
-                test_data = test.get()
-                if test_data:
-                    test_batch_features = test_data["logits"].to(device=device, dtype=torch.float32)
-                    test_batch_labels = test_data["answer_tok_ids"].to(device=device, dtype=torch.long)
-                    
-                    with torch.no_grad():
-                        test_cal_confidence = model.scale_logits(test_batch_features)
-                        test_loss = torch.nn.functional.cross_entropy(
-                            test_cal_confidence,
-                            test_batch_labels
-                        )
-                        test_losses.append(test_loss.item())
-                    
-                    iterations.append(iteration_counter)
-            iteration_counter += 1
-
-    if len(iterations) > 0 and (verbose or logging):
-        fig, ax = plt.subplots(figsize=(4, 4))
-        ax.plot(iterations, train_losses, label="Train Loss", marker="o")
-        if len(test_losses) > 0:
-            ax.plot(iterations, test_losses, label="Test Loss", marker="s")
-        ax.set_xlabel("Iteration")
-        ax.set_ylabel("Loss")
-        ax.set_title("Training and Test Loss over Iterations")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        if logging:
-            Path(log_dir).mkdir(parents=True, exist_ok=True)
-            fname = log_filename or make_next_indexed_log_filename(
-                log_dir=log_dir,
-                prefix="calibration_fit_loss",
-                extension=".png",
-            )
-            out_path = os.path.join(log_dir, fname)
-            fig.savefig(out_path, dpi=200, bbox_inches="tight")
-        if verbose:
-            plt.show()
-        plt.close(fig)
-
-    return model
+    return model, best_epoch
 
 def fit_hparameters_beta(
     model_class: CalibrationHead,
@@ -360,6 +256,8 @@ def fit_hparameters_beta(
     device: torch.device,
     search_trials=20,
     random_seed: Optional[int] = None,
+    max_epochs=20,
+    patience=3,
     verbose: bool = False,
     logging: bool = False,
     log_dir: Optional[str] = None,
@@ -368,7 +266,7 @@ def fit_hparameters_beta(
     Random search over training hyperparameters for beta calibration.
 
     Samples up to ``search_trials`` configs from a grid over learning rates,
-    batch size, and epochs; fits each with ``fit_calibration_model_beta`` and
+    and batch size; fits each with ``fit_calibration_model_beta`` and
     scores on ``test`` and ``test_calibration_model``. Also computes
     SHAP-like feature attributions per trial.
 
@@ -379,7 +277,10 @@ def fit_hparameters_beta(
         features_count: Input dimension.
         device: torch.device to perform computations on.
         search_trials: Number of hyperparameter combinations to try.
-        random_seed: Seed for shuffling/sampling the grid; None for nondeterministic.
+        random_seed: Seed for shuffling/sampling the grid and the batch order;
+            None for nondeterministic.
+        max_epochs: Upper bound on training epochs per trial.
+        patience: Epochs without validation improvement before stopping.
         verbose: Show trial ECE-diagram and enable nested training verbosity.
         logging: Log per-trial outputs.
         log_dir: Root directory; each trial uses ``search_iter_XXX`` subfolders by deafualt.
@@ -392,7 +293,6 @@ def fit_hparameters_beta(
         "lr_max": [1e-2, 5e-3, 2e-3, 1e-3],
         "lr_min": [1e-3, 5e-4, 2e-4, 1e-4],
         "batch_size": [16, 32],
-        "epochs": [1, 3, 5, 10],
     }
     all_candidates = list(ParameterGrid(param_grid))
     rng = np.random.default_rng(random_seed)
@@ -414,9 +314,8 @@ def fit_hparameters_beta(
         lr_max = float(sampled["lr_max"])
         lr_min = float(sampled["lr_min"])
         batch_size = int(sampled["batch_size"])
-        epochs = int(sampled["epochs"])
 
-        model = fit_calibration_model_beta(
+        model, best_epoch = fit_calibration_model_beta(
             model_class(
                 in_features=features_count + 1,
                 device=device
@@ -426,7 +325,9 @@ def fit_hparameters_beta(
             lr_max=lr_max,
             lr_min=lr_min,
             batch_size=batch_size,
-            epochs=epochs,
+            max_epochs=max_epochs,
+            patience=patience,
+            shuffle_seed=random_seed,
             device=device,
             verbose=verbose,
             logging=logging,
@@ -470,7 +371,7 @@ def fit_hparameters_beta(
                     "lr_max": lr_max,
                     "lr_min": lr_min,
                     "batch_size": batch_size,
-                    "epochs": epochs,
+                    "best_epoch": best_epoch,
                 },
                 "parameters": model.state_dict(),
                 "ece+inv_bss": metrics["ece+inv_bss"],
@@ -515,6 +416,8 @@ def fit_hparameters_temp(
     device: torch.device,
     search_trials=20,
     random_seed: Optional[int] = None,
+    max_epochs=20,
+    patience=3,
     verbose: bool = False,
     logging: bool = False,
     log_dir: Optional[str] = None,
@@ -532,7 +435,10 @@ def fit_hparameters_temp(
         features_count: Input dimension.
         device: torch.device to perform computations on.
         search_trials: Number of hyperparameter combinations to try.
-        random_seed: Seed for shuffling/sampling the grid; None for nondeterministic.
+        random_seed: Seed for shuffling/sampling the grid and the batch order;
+            None for nondeterministic.
+        max_epochs: Upper bound on training epochs per trial.
+        patience: Epochs without validation improvement before stopping.
         verbose: Show trial ECE-diagram and enable nested training verbosity.
         logging: Log per-trial outputs.
         log_dir: Root directory; each trial uses ``search_iter_XXX`` subfolders by deafualt.
@@ -545,7 +451,6 @@ def fit_hparameters_temp(
         "lr_max": [1e-2, 5e-3, 2e-3, 1e-3],
         "lr_min": [1e-3, 5e-4, 2e-4, 1e-4],
         "batch_size": [16, 32],
-        "epochs": [1, 3],
     }
     all_candidates = list(ParameterGrid(param_grid))
     rng = np.random.default_rng(random_seed)
@@ -567,9 +472,8 @@ def fit_hparameters_temp(
         lr_max = float(sampled["lr_max"])
         lr_min = float(sampled["lr_min"])
         batch_size = int(sampled["batch_size"])
-        epochs = int(sampled["epochs"])
 
-        model = fit_calibration_model_temp(
+        model, best_epoch = fit_calibration_model_temp(
             model_class(
                 in_features=features_count + 1,
                 device=device
@@ -579,7 +483,9 @@ def fit_hparameters_temp(
             lr_max=lr_max,
             lr_min=lr_min,
             batch_size=batch_size,
-            epochs=epochs,
+            max_epochs=max_epochs,
+            patience=patience,
+            shuffle_seed=random_seed,
             device=device,
             verbose=verbose,
             logging=logging,
@@ -618,7 +524,7 @@ def fit_hparameters_temp(
                     "lr_max": lr_max,
                     "lr_min": lr_min,
                     "batch_size": batch_size,
-                    "epochs": epochs,
+                    "best_epoch": best_epoch,
                 },
                 "parameters": model.state_dict(),
                 "ece+inv_bss": metrics["ece+inv_bss"],

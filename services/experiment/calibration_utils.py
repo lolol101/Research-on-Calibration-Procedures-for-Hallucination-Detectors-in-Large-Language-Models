@@ -18,7 +18,8 @@ from ..common.calculation_utils import (
     calculate_roc_auc,
 )
 from ..common.calibration_heads import CalibrationHead
-from ..common.logging_utils import log_data, make_next_indexed_log_filename
+from ..common.training_utils import fit_with_early_stopping
+from ..common.logging_utils import log_data
 from ..index import IndexDataset
 
 def find_best_layer_head_hdp(
@@ -250,12 +251,13 @@ def fit_calibration_model(
     train: IndexDataset,
     feature_ids: torch.Tensor,
     device: torch.device,
-    test: Optional[IndexDataset] = None,
+    test: IndexDataset,
     lr_max=1e-2,
     lr_min=1e-4,
     batch_size=64,
-    epochs=3,
-    plot_interval=3,
+    max_epochs=20,
+    patience=3,
+    shuffle_seed: Optional[int] = None,
     verbose: bool = False,
     logging: bool = False,
     log_dir: Optional[str] = None,
@@ -266,118 +268,64 @@ def fit_calibration_model(
     """
     Trains an experiment calibration head on a feature subset.
 
-    Uses BCE on ``train_batch["features"][:, feature_ids]`` with optional
-    L1/L2 regularization. AdamW + cosine schedule; optional loss curves.
+    Uses BCE on ``features[:, feature_ids]`` with optional L1/L2
+    regularization, stopping early on the unregularized validation BCE (see
+    ``fit_with_early_stopping``).
 
     Args:
         model: Calibration module.
         train: Training ``IndexDataset`` with ``features`` and ``labels``.
         feature_ids: Column indices into the feature matrix.
         device: Device for tensors and the model.
-        test: Optional validation set for loss logging.
-        lr_max: Initial AdamW learning rate.
-        lr_min: Cosine scheduler floor learning rate.
-        batch_size: Mini-batch size.
-        epochs: Training epochs.
-        plot_interval: Log train/test loss every N steps.
-        verbose: tqdm and matplotlib display.
-        logging: Save loss plot to ``log_dir``.
-        log_dir: Plot output directory.
-        log_filename: Override default filename when logging.
+        test: Validation ``IndexDataset`` used for early stopping.
+        lr_max: Initial learning rate for AdamW.
+        lr_min: Minimum learning rate for the cosine scheduler.
+        batch_size: Mini-batch size over ``train``.
+        max_epochs: Upper bound on the number of passes over ``train``.
+        patience: Epochs without validation improvement before stopping.
+        shuffle_seed: Seed for the per-epoch batch order.
+        verbose: Show tqdm progress and the loss plot.
+        logging: Save the loss plot to ``log_dir``.
+        log_dir: Output directory for logged results.
+        log_filename: Override auto-generated files names when logging.
         l1_lambda: L1 penalty strength on weights.
         l2_lambda: L2 penalty strength on weights.
 
     Returns:
-        Trained ``model`` (mutated in place).
+        Tuple ``(model, best_epoch)``: the trained ``model`` (mutated in
+        place) and the epoch whose weights it holds.
     """
-    optimizer = torch.optim.AdamW(model.parameters(), lr_max)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, epochs * (len(train) // batch_size), lr_min
-    )
+    train_data, val_data = train.get(), test.get()
 
-    train_losses = []
-    test_losses = []
-    iterations = []
-    
-    iteration_counter = 0
-    for _ in tqdm(range(epochs), desc="Training (epochs)...", disable=not verbose):
-        for start in range(0, len(train), batch_size):
-            train_batch = train.get(start, min(start + batch_size, len(train)))
-            if not train_batch:
-                continue
-
-            optimizer.zero_grad()
-
-            train_batch_features = train_batch["features"][:, feature_ids].to(device=device, dtype=torch.float32)
-            train_cal_confidence = model(train_batch_features)
-            train_batch_labels = train_batch["labels"].to(device=device, dtype=torch.float32)
-            
-            train_loss, _, _, _ = _calibration_training_loss(
-                train_cal_confidence,
-                train_batch_labels,
-                model,
-                l1_lambda=l1_lambda,
-                l2_lambda=l2_lambda,
-            )
-
-            train_loss.backward()
-            # torch.nn.utils.clip_grad_norm_(temp_model.parameters(), max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-
-            if (
-                test is not None
-                and iteration_counter % plot_interval == 0
-            ):
-                train_total = train_loss.detach().item()
-                train_losses.append(train_total)
-
-                test_data = test.get()
-                if test_data:
-                    test_batch_features = test_data["features"][:, feature_ids].to(device=device, dtype=torch.float32)
-                    test_batch_labels = test_data["labels"].to(device=device, dtype=torch.float32)
-                    
-                    with torch.no_grad():
-                        test_cal_confidence = model(test_batch_features)
-                        test_loss, _, _, _ = _calibration_training_loss(
-                            test_cal_confidence,
-                            test_batch_labels,
-                            model,
-                            l1_lambda=l1_lambda,
-                            l2_lambda=l2_lambda,
-                        )
-                        test_losses.append(test_loss.item())
-                    
-                    iterations.append(iteration_counter)
-            iteration_counter += 1
-
-    if len(iterations) > 0 and (verbose or logging):
-        fig, ax = plt.subplots(figsize=(4, 4))
-        ax.plot(iterations, train_losses, label="Train Loss", marker="o")
-        if len(test_losses) > 0:
-            ax.plot(iterations, test_losses, label="Test Loss", marker="s")
-        ax.set_xlabel("Iteration")
-        ax.set_ylabel("Loss")
-        ax.set_title(
-            f"Training and Test Loss (l1_lambda={l1_lambda}, l2_lambda={l2_lambda})"
+    def loss_fn(model, features, labels):
+        total, bce, _, _ = _calibration_training_loss(
+            model(features),
+            labels,
+            model,
+            l1_lambda=l1_lambda,
+            l2_lambda=l2_lambda,
         )
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        if logging:
-            Path(log_dir).mkdir(parents=True, exist_ok=True)
-            fname = log_filename or make_next_indexed_log_filename(
-                log_dir=log_dir,
-                prefix="calibration_fit_loss",
-                extension=".png",
-            )
-            out_path = os.path.join(log_dir, fname)
-            fig.savefig(out_path, dpi=200, bbox_inches="tight")
-        if verbose:
-            plt.show()
-        plt.close(fig)
+        return total, bce
 
-    return model
+    best_epoch = fit_with_early_stopping(
+        model,
+        train_data["features"][:, feature_ids].to(device=device, dtype=torch.float32),
+        train_data["labels"].to(device=device, dtype=torch.float32),
+        val_data["features"][:, feature_ids].to(device=device, dtype=torch.float32),
+        val_data["labels"].to(device=device, dtype=torch.float32),
+        loss_fn,
+        lr_max=lr_max,
+        lr_min=lr_min,
+        batch_size=batch_size,
+        max_epochs=max_epochs,
+        patience=patience,
+        shuffle_seed=shuffle_seed,
+        verbose=verbose,
+        logging=logging,
+        log_dir=log_dir,
+        log_filename=log_filename,
+    )
+    return model, best_epoch
 
 def fit_hparameters(
     model_class: CalibrationHead,
@@ -392,6 +340,8 @@ def fit_hparameters(
     l1_reg=False,
     l2_reg=False,
     random_seed: Optional[int] = None,
+    max_epochs=20,
+    patience=3,
     verbose: bool = False,
     logging: bool = False,
     log_dir: Optional[str] = None,
@@ -415,7 +365,9 @@ def fit_hparameters(
         search_trials: Number of grid samples to evaluate.
         l1_reg: Include L1 penalty values in the search grid.
         l2_reg: Include L2 penalty values in the search grid.
-        random_seed: RNG seed for shuffling/sampling the grid.
+        random_seed: RNG seed for shuffling/sampling the grid and the batch order.
+        max_epochs: Upper bound on training epochs per trial.
+        patience: Epochs without validation improvement before stopping.
         verbose: Per-trial training and metric printing.
         logging: Log trials and best hyperparameters under ``log_dir``.
 
@@ -427,7 +379,6 @@ def fit_hparameters(
         "lr_max": [1e-2, 5e-3, 2e-3, 1e-3],
         "lr_min": [1e-3, 5e-4, 2e-4, 1e-4],
         "batch_size": [16, 32],
-        "epochs": [1, 3, 5, 10],
         "l1_lambda": [0.0, 1e-5, 1e-4, 1e-3, 1e-2] if l1_reg else [0.0],
         "l2_lambda": [0.0, 1e-5, 1e-4, 1e-3, 1e-2] if l2_reg else [0.0],
     }
@@ -451,11 +402,10 @@ def fit_hparameters(
         lr_max = float(sampled["lr_max"])
         lr_min = float(sampled["lr_min"])
         batch_size = int(sampled["batch_size"])
-        epochs = int(sampled["epochs"])
         l1_lambda = float(sampled["l1_lambda"])
         l2_lambda = float(sampled["l2_lambda"])
 
-        model = fit_calibration_model(
+        model, best_epoch = fit_calibration_model(
             model_class(
                 in_features=(features_count + 1) * (heads_count + (not attn_only)),
                 device=device
@@ -466,7 +416,9 @@ def fit_hparameters(
             lr_max=lr_max,
             lr_min=lr_min,
             batch_size=batch_size,
-            epochs=epochs,
+            max_epochs=max_epochs,
+            patience=patience,
+            shuffle_seed=random_seed,
             device=device,
             verbose=verbose,
             logging=logging,
@@ -514,7 +466,7 @@ def fit_hparameters(
                     "lr_max": lr_max,
                     "lr_min": lr_min,
                     "batch_size": batch_size,
-                    "epochs": epochs,
+                    "best_epoch": best_epoch,
                     "l1_lambda": l1_lambda,
                     "l2_lambda": l2_lambda,
                 },
