@@ -172,6 +172,7 @@ def main():
 
     from services.baseline.pipeline import run_baseline_calibrations
     from services.experiment.pipeline import run_experiment_calibrations
+    from services.feature_cache import FeatureCache
     from services.index import Index
 
     spec = get_dataset(args.dataset)
@@ -191,13 +192,16 @@ def main():
         raise SystemExit(f"Index {index_name!r} in {args.index_dir} holds no records.")
     print(f"Index: {index_name} ({len(index)} records)")
 
+    # Built on the first run over this index, read by every later one.
+    cache = FeatureCache(index, args.regime, answer_label=spec.answer_label, verbose=args.verbose)
+    print(f"Features: {cache.path}")
+
     log_dir = os.path.join(args.logs_dir, index_name, args.method)
 
     if args.method == "baseline":
         run_baseline_calibrations(
-            index=index,
+            cache=cache,
             device=device,
-            answer_label=spec.answer_label,
             search_trials=args.search_trials,
             search_seed=args.seed,
             split_seed=args.seed,
@@ -209,7 +213,7 @@ def main():
     else:
         log_dir = os.path.join(log_dir, experiment_log_subdir(args))
         run_experiment_calibrations(
-            index=index,
+            cache=cache,
             regime=args.regime,
             device=device,
             attn_only=args.attn_only,
@@ -221,7 +225,6 @@ def main():
             split_seed=args.seed,
             l1_reg=args.l1,
             l2_reg=args.l2,
-            answer_label=spec.answer_label,
             bootstrap=args.bootstrap,
             verbose=args.verbose,
             logging=True,

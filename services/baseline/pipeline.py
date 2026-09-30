@@ -1,26 +1,22 @@
-from functools import partial
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 
 from ..common.calibration_heads import BetaCalibrationHead, TemperatureCalibrationHead
-from ..common.datasets import letter_answer_label
-from ..index import Index, IndexDataset
+from ..feature_cache import FeatureCache
 from .calibration_utils import (
     fit_hparameters_beta,
     fit_hparameters_temp,
     test_calibration_model,
 )
-from .data_process_utils import process_elements_main
 
 # The baseline works with the final-token probability alone.
 FEATURES_COUNT = 0
 
 
 def run_baseline_calibrations(
-    index: Index,
+    cache: FeatureCache,
     device: torch.device,
-    answer_label: Callable[[dict], str] = letter_answer_label,
     search_trials: int = 20,
     search_seed: Optional[int] = None,
     split_seed: Optional[int] = None,
@@ -37,10 +33,8 @@ def run_baseline_calibrations(
     the best model is evaluated on the test split.
 
     Args:
-        index: ``Index`` with collected model responses.
+        cache: ``FeatureCache`` of the index to calibrate.
         device: torch.device to perform computations on.
-        answer_label: Callable mapping ``dataset_elem`` to the expected answer
-            token; pass the matching ``DatasetSpec.answer_label``.
         search_trials: Hyperparameter combinations tried per calibration head.
         search_seed: Seed for sampling hyperparameter combinations; ``None``
             draws a different sample on every call.
@@ -65,14 +59,7 @@ def run_baseline_calibrations(
         return f"{log_dir}/({method})calibration_res/{stage}" if logging else None
 
     splits = {
-        split: IndexDataset(
-            index,
-            partial(process_elements_main, device=device, answer_label=answer_label),
-            split=split,
-            load_all_data=True,
-            split_seed=split_seed,
-            verbose=verbose,
-        )
+        split: cache.baseline_split(split, device, split_seed=split_seed)
         for split in ("train", "val", "test")
     }
     test_data = splits["test"].get()

@@ -1,5 +1,4 @@
-from functools import partial
-from typing import Callable, Optional, Sequence
+from typing import Optional, Sequence
 
 import torch
 from tqdm import tqdm
@@ -9,23 +8,15 @@ from ..common.calibration_heads import (
     MLPCalibrationHead,
     WeightedBetaCalibrationHead,
 )
-from ..common.datasets import COT_REGIME, CROPPED_REGIME, letter_answer_label
+from ..common.datasets import COT_REGIME, CROPPED_REGIME
 from ..common.logging_utils import log_data
-from ..index import Index, IndexDataset
+from ..feature_cache import FeatureCache
 from .calibration_utils import (
     find_best_layer_head_hdp,
     find_best_layer_head_roc_auc,
     fit_hparameters,
     test_calibration_model,
 )
-from .cot import data_process_utils as cot_processing
-from .cropped import data_process_utils as cropped_processing
-
-PROCESSING = {
-    COT_REGIME: cot_processing,
-    CROPPED_REGIME: cropped_processing,
-}
-
 # Aggregated statistics per score column: CoT adds the seven reasoning-span
 # statistics of ``calculate_agg_features`` to the answer-token scores.
 FEATURES_COUNT = {
@@ -45,70 +36,29 @@ CALIBRATION_HEADS = {
 }
 
 
-def infer_attention_shape(index: Index):
-    """
-    Reads the number of layers and heads from the first stored record.
-
-    Args:
-        index: Non-empty ``Index`` with ``attention_entropy`` per token.
-
-    Returns:
-        Tuple ``(layers_count, heads_count)``.
-    """
-    elem = index.load_data(0, 1)[0]
-    attention_entropy = torch.stack(
-        elem["attention_entropy"], dim=0
-    ).squeeze(-1) # [T, L, H]
-    return attention_entropy.shape[1], attention_entropy.shape[2]
-
-
 def select_heads(
-    index: Index,
-    regime: str,
-    layers_count: int,
-    heads_count: int,
+    cache: FeatureCache,
     best_heads_group_size: int,
     hs_size: int,
     device: torch.device,
     split_seed: Optional[int] = None,
-    answer_label: Callable[[dict], str] = letter_answer_label,
-    verbose: bool = False,
 ):
     """
     Ranks attention heads on the val split by every criterion in ``HEAD_SELECTORS``.
 
     Args:
-        index: ``Index`` with collected model responses.
-        regime: ``"cot"`` or ``"cropped"``.
-        layers_count: Number of transformer layers.
-        heads_count: Number of heads per layer.
+        cache: ``FeatureCache`` of the index to calibrate.
         best_heads_group_size: How many (layer, head) pairs to keep.
         hs_size: Number of leading val records used for selection; 0 uses all.
         device: torch.device to perform computations on.
         split_seed: Seed for shuffling records before the train/val/test
             split; ``None`` keeps the contiguous storage order.
-        answer_label: Callable mapping ``dataset_elem`` to the expected answer.
-        verbose: If True, show progress.
 
     Returns:
         Dict mapping selector name to ``(best_layers, best_heads)``.
     """
-    head_selection_dataset = IndexDataset(
-        index=index,
-        process_elements=partial(
-            PROCESSING[regime].process_elements_hdp,
-            layers_count=layers_count,
-            heads_count=heads_count,
-            answer_label=answer_label,
-            device=device,
-        ),
-        split="val",
-        load_all_data=True,
-        split_seed=split_seed,
-        verbose=verbose,
-    )
-    head_selection_data = head_selection_dataset.get(end=hs_size) if hs_size > 0 \
-        else head_selection_dataset.get()
+    _, layers_count, heads_count = cache.attention_entropy.shape # [N, L, H]
+    head_selection_data = cache.head_selection_data(hs_size, device, split_seed=split_seed)
 
     return {
         name: selector(
@@ -122,7 +72,7 @@ def select_heads(
 
 
 def run_experiment_calibrations(
-    index: Index,
+    cache: FeatureCache,
     regime: str,
     device: torch.device,
     attn_only: bool = False,
@@ -134,7 +84,6 @@ def run_experiment_calibrations(
     split_seed: Optional[int] = None,
     l1_reg: bool = True,
     l2_reg: bool = False,
-    answer_label: Callable[[dict], str] = letter_answer_label,
     bootstrap: bool = False,
     verbose: bool = False,
     logging: bool = False,
@@ -149,7 +98,7 @@ def run_experiment_calibrations(
     once per number of selected heads.
 
     Args:
-        index: ``Index`` with collected model responses.
+        cache: ``FeatureCache`` of the index to calibrate.
         regime: ``"cot"`` or ``"cropped"``.
         device: torch.device to perform computations on.
         attn_only: If True, omit final-token confidence features.
@@ -163,8 +112,6 @@ def run_experiment_calibrations(
             split; ``None`` keeps the contiguous storage order.
         l1_reg: Include L1 penalty values in the search grid.
         l2_reg: Include L2 penalty values in the search grid.
-        answer_label: Callable mapping ``dataset_elem`` to the expected answer
-            token; pass the matching ``DatasetSpec.answer_label``.
         bootstrap: If True, add bootstrap confidence intervals to test metrics.
         verbose: If True, show progress and print metrics.
         logging: If True, write selected heads, training and test logs under ``log_dir``.
@@ -189,21 +136,12 @@ def run_experiment_calibrations(
     features_count = FEATURES_COUNT[regime]
     block_size = best_heads_group_size + (not attn_only)
 
-    layers_count, heads_count = infer_attention_shape(index)
-    if verbose:
-        print(f"Attention shape: {layers_count} layers x {heads_count} heads")
-
     selected_heads = select_heads(
-        index=index,
-        regime=regime,
-        layers_count=layers_count,
-        heads_count=heads_count,
+        cache=cache,
         best_heads_group_size=best_heads_group_size,
         hs_size=hs_size,
         split_seed=split_seed,
         device=device,
-        answer_label=answer_label,
-        verbose=verbose,
     )
 
     results = {}
@@ -219,20 +157,13 @@ def run_experiment_calibrations(
             )
 
         splits = {
-            split: IndexDataset(
-                index,
-                partial(
-                    PROCESSING[regime].process_elements_main,
-                    best_layers=best_layers,
-                    best_heads=best_heads,
-                    attn_only=attn_only,
-                    answer_label=answer_label,
-                    device=device,
-                ),
-                split=split,
-                load_all_data=True,
+            split: cache.experiment_split(
+                split,
+                best_layers,
+                best_heads,
+                device,
+                attn_only=attn_only,
                 split_seed=split_seed,
-                verbose=verbose,
             )
             for split in ("train", "val", "test")
         }

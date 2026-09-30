@@ -157,6 +157,37 @@ def _split_rank(seed, row_id):
     return int.from_bytes(digest, "big")
 
 
+def split_positions(index, split, train_split=0.8, val_split=0.9, split_seed=None):
+    """Record positions of one train/val/test split, in split order.
+
+    Args:
+        index: ``Index`` whose records are split.
+        split: One of ``"train"``, ``"val"``, or ``"test"``.
+        train_split: Fraction of records for training.
+        val_split: Upper fraction bound for validation.
+        split_seed: If set, records are shuffled before splitting;
+            ``None`` keeps the contiguous storage order.
+
+    Returns:
+        List of record positions (offset indices) in the split.
+    """
+    order = list(range(len(index)))
+    if split_seed is not None:
+        # Datasets such as MMLU-Pro are stored grouped by category, so a
+        # contiguous split would put different domains in train and test.
+        # Ranking by a hash of the dataset row keeps a question in the same
+        # split across models and regimes collected from that dataset.
+        order.sort(key=lambda i: _split_rank(split_seed, index.iterations[i]))
+
+    train_end = int(len(index) * train_split)
+    val_end = int(len(index) * val_split)
+    if split == "train":
+        return order[:train_end]
+    if split == "val":
+        return order[train_end:val_end]
+    return order[val_end:]
+
+
 class IndexDataset(Dataset):
     """PyTorch-style view over an ``Index`` with split and optional preprocessing."""
 
@@ -190,22 +221,7 @@ class IndexDataset(Dataset):
         self.verbose = verbose
         self.process_elements = process_elements
 
-        order = list(range(len(index)))
-        if split_seed is not None:
-            # Datasets such as MMLU-Pro are stored grouped by category, so a
-            # contiguous split would put different domains in train and test.
-            # Ranking by a hash of the dataset row keeps a question in the same
-            # split across models and regimes collected from that dataset.
-            order.sort(key=lambda i: _split_rank(split_seed, index.iterations[i]))
-
-        train_end = int(len(index) * train_split)
-        val_end = int(len(index) * val_split)
-        if split == "train":
-            self.indices = order[:train_end]
-        elif split == "val":
-            self.indices = order[train_end:val_end]
-        else:
-            self.indices = order[val_end:]
+        self.indices = split_positions(index, split, train_split, val_split, split_seed)
 
         if load_all_data:
             self._load_data()
