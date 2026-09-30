@@ -70,6 +70,7 @@ def select_heads(
     best_heads_group_size: int,
     hs_size: int,
     device: torch.device,
+    split_seed: Optional[int] = None,
     answer_label: Callable[[dict], str] = letter_answer_label,
     verbose: bool = False,
 ):
@@ -84,6 +85,8 @@ def select_heads(
         best_heads_group_size: How many (layer, head) pairs to keep.
         hs_size: Number of leading val records used for selection; 0 uses all.
         device: torch.device to perform computations on.
+        split_seed: Seed for shuffling records before the train/val/test
+            split; ``None`` keeps the contiguous storage order.
         answer_label: Callable mapping ``dataset_elem`` to the expected answer.
         verbose: If True, show progress.
 
@@ -101,6 +104,7 @@ def select_heads(
         ),
         split="val",
         load_all_data=True,
+        split_seed=split_seed,
         verbose=verbose,
     )
     head_selection_data = head_selection_dataset.get(end=hs_size) if hs_size > 0 \
@@ -126,6 +130,8 @@ def run_experiment_calibrations(
     best_heads_group_size: int = 30,
     heads_group_sizes: Sequence[int] = (1, 3, 5, 7, 10, 15, 20, 30),
     search_trials: int = 20,
+    search_seed: Optional[int] = None,
+    split_seed: Optional[int] = None,
     l1_reg: bool = True,
     l2_reg: bool = False,
     answer_label: Callable[[dict], str] = letter_answer_label,
@@ -151,6 +157,10 @@ def run_experiment_calibrations(
         best_heads_group_size: How many (layer, head) pairs to select.
         heads_group_sizes: Numbers of best heads fed to the calibration head.
         search_trials: Hyperparameter combinations tried per fit.
+        search_seed: Seed for sampling hyperparameter combinations; ``None``
+            draws a different sample on every call.
+        split_seed: Seed for shuffling records before the train/val/test
+            split; ``None`` keeps the contiguous storage order.
         l1_reg: Include L1 penalty values in the search grid.
         l2_reg: Include L2 penalty values in the search grid.
         answer_label: Callable mapping ``dataset_elem`` to the expected answer
@@ -190,6 +200,7 @@ def run_experiment_calibrations(
         heads_count=heads_count,
         best_heads_group_size=best_heads_group_size,
         hs_size=hs_size,
+        split_seed=split_seed,
         device=device,
         answer_label=answer_label,
         verbose=verbose,
@@ -220,6 +231,7 @@ def run_experiment_calibrations(
                 ),
                 split=split,
                 load_all_data=True,
+                split_seed=split_seed,
                 verbose=verbose,
             )
             for split in ("train", "val", "test")
@@ -257,6 +269,7 @@ def run_experiment_calibrations(
                     feature_ids=feature_ids,
                     heads_count=group_size,
                     search_trials=search_trials,
+                    random_seed=search_seed,
                     device=device,
                     logging=logging,
                     log_dir=local_log_dir + f"train#{group_size}" if logging else None,

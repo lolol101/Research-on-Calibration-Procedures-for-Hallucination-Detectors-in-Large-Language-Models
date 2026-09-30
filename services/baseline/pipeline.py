@@ -22,6 +22,8 @@ def run_baseline_calibrations(
     device: torch.device,
     answer_label: Callable[[dict], str] = letter_answer_label,
     search_trials: int = 20,
+    search_seed: Optional[int] = None,
+    split_seed: Optional[int] = None,
     bootstrap: bool = False,
     verbose: bool = False,
     logging: bool = False,
@@ -40,6 +42,10 @@ def run_baseline_calibrations(
         answer_label: Callable mapping ``dataset_elem`` to the expected answer
             token; pass the matching ``DatasetSpec.answer_label``.
         search_trials: Hyperparameter combinations tried per calibration head.
+        search_seed: Seed for sampling hyperparameter combinations; ``None``
+            draws a different sample on every call.
+        split_seed: Seed for shuffling records before the train/val/test
+            split; ``None`` keeps the contiguous storage order.
         bootstrap: If True, add bootstrap confidence intervals to test metrics.
         verbose: If True, show progress and print metrics.
         logging: If True, write training and test logs under ``log_dir``.
@@ -64,6 +70,7 @@ def run_baseline_calibrations(
             partial(process_elements_main, device=device, answer_label=answer_label),
             split=split,
             load_all_data=True,
+            split_seed=split_seed,
             verbose=verbose,
         )
         for split in ("train", "val", "test")
@@ -92,6 +99,7 @@ def run_baseline_calibrations(
         features_count=FEATURES_COUNT,
         device=device,
         search_trials=search_trials,
+        random_seed=search_seed,
         logging=logging,
         log_dir=method_log_dir("beta", "train"),
     )
@@ -115,6 +123,7 @@ def run_baseline_calibrations(
         features_count=FEATURES_COUNT,
         device=device,
         search_trials=search_trials,
+        random_seed=search_seed,
         logging=logging,
         log_dir=method_log_dir("temperature", "train"),
     )

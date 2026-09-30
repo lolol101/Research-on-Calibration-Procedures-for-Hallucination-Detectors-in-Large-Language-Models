@@ -90,7 +90,7 @@ def parse_args():
         "--seed",
         type=int,
         default=42,
-        help="Torch RNG seed (default: 42).",
+        help="Seed for torch, the train/val/test shuffle, and hyperparameter sampling (default: 42).",
     )
     parser.add_argument(
         "--search-trials",
@@ -199,6 +199,8 @@ def main():
             device=device,
             answer_label=spec.answer_label,
             search_trials=args.search_trials,
+            search_seed=args.seed,
+            split_seed=args.seed,
             bootstrap=args.bootstrap,
             verbose=args.verbose,
             logging=True,
@@ -215,6 +217,8 @@ def main():
             best_heads_group_size=args.best_heads,
             heads_group_sizes=args.heads_group_sizes,
             search_trials=args.search_trials,
+            search_seed=args.seed,
+            split_seed=args.seed,
             l1_reg=args.l1,
             l2_reg=args.l2,
             answer_label=spec.answer_label,

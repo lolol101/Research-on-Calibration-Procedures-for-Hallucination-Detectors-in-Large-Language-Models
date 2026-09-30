@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 import pickle
@@ -81,7 +82,31 @@ class Index:
                 ):
                 f.seek(self.offsets[i])
                 data.append(pickle.load(f))
-            return data 
+            return data
+
+    def load_records(self, positions, verbose=False):
+        """Loads records at arbitrary positions, returned in the order given.
+
+        The file is read in ascending offset order, so a scattered selection
+        costs one forward pass rather than random seeks.
+
+        Args:
+            positions: Record positions (offset indices) to read.
+            verbose: If True, show a tqdm progress bar.
+
+        Returns:
+            List of unpickled objects aligned with ``positions``.
+        """
+        records = {}
+        with open(self.data_filename, "rb") as f:
+            for i in tqdm(
+                    sorted(set(positions)),
+                    desc="Loading index...",
+                    disable=not verbose
+                ):
+                f.seek(self.offsets[i])
+                records[i] = pickle.load(f)
+        return [records[i] for i in positions]
 
     def load_data_generator(self, start_iter=0, end_iter=None, batch_size=1):
         """Yields lists of records in batches of ``batch_size``.
@@ -126,6 +151,12 @@ class Index:
         print("Index is cleared successfully.")
 
 
+def _split_rank(seed, row_id):
+    """Deterministic pseudo-random rank of a dataset row for a given seed."""
+    digest = hashlib.blake2b(f"{seed}:{row_id}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big")
+
+
 class IndexDataset(Dataset):
     """PyTorch-style view over an ``Index`` with split and optional preprocessing."""
 
@@ -137,6 +168,7 @@ class IndexDataset(Dataset):
         load_all_data=False,
         train_split=0.8,
         val_split=0.9,
+        split_seed=None,
         verbose=False
     ):
         """Configures a train/val/test slice and optional eager loading.
@@ -148,7 +180,9 @@ class IndexDataset(Dataset):
             load_all_data: If True, preprocess the full split at init time.
             train_split: Fraction of records for training (default 0.8).
             val_split: Upper fraction bound for validation (default 0.9).
-            verbose: Passed to ``Index.load_data`` and ``process_elements``.
+            split_seed: If set, records are shuffled before splitting;
+                ``None`` keeps the contiguous storage order.
+            verbose: Passed to ``Index.load_records`` and ``process_elements``.
         """
         self.index = index
         self.split = split
@@ -156,16 +190,22 @@ class IndexDataset(Dataset):
         self.verbose = verbose
         self.process_elements = process_elements
 
+        order = list(range(len(index)))
+        if split_seed is not None:
+            # Datasets such as MMLU-Pro are stored grouped by category, so a
+            # contiguous split would put different domains in train and test.
+            # Ranking by a hash of the dataset row keeps a question in the same
+            # split across models and regimes collected from that dataset.
+            order.sort(key=lambda i: _split_rank(split_seed, index.iterations[i]))
+
+        train_end = int(len(index) * train_split)
+        val_end = int(len(index) * val_split)
         if split == "train":
-            self.indices = list(range(int(len(index) * train_split)))
+            self.indices = order[:train_end]
         elif split == "val":
-            self.indices = list(
-                range(
-                    int(len(index) * train_split), int(len(index) * val_split)
-                )
-            )
+            self.indices = order[train_end:val_end]
         else:
-            self.indices = list(range(int(len(index) * val_split), len(index)))
+            self.indices = order[val_end:]
 
         if load_all_data:
             self._load_data()
@@ -174,20 +214,10 @@ class IndexDataset(Dataset):
         """Number of records in this split."""
         return len(self.indices)
 
-    def _map_end_index(self, end: int) -> int:
-        """Map exclusive split position ``end`` to ``Index.load_data`` end (exclusive)."""
-        if end < len(self.indices):
-            return self.indices[end]
-        return self.indices[-1] + 1
-
     def _load_data(self):
         """Eagerly load and preprocess the full split into ``self.data``."""
         self.data = self.process_elements(
-            np.array(self.index.load_data(
-                self.indices[0],
-                self._map_end_index(len(self.indices)),
-                verbose=self.verbose
-            )),
+            np.array(self.index.load_records(self.indices, verbose=self.verbose)),
             verbose=self.verbose
         )
 
@@ -211,11 +241,7 @@ class IndexDataset(Dataset):
             }
 
         return self.process_elements(
-            self.index.load_data(
-                self.indices[start],
-                self._map_end_index(end),
-                verbose=self.verbose
-            ),
+            self.index.load_records(self.indices[start:end], verbose=self.verbose),
             verbose=self.verbose
         )
         
