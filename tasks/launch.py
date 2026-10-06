@@ -1,7 +1,6 @@
 """Collect model responses and per-token scores into an ``Index``.
 
-Command-line equivalent of the per-model launch notebooks under ``legacy/launches/``,
-parameterised by model, dataset and response regime so that several
+Parameterised by model, dataset and response regime so that several
 collections can run side by side, one process per GPU::
 
     python tasks/launch.py --model Qwen/Qwen3-4B \\
@@ -25,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from services.common.datasets import COT_REGIME, REGIMES, DATASETS, get_dataset
+from services.common.datasets import COT_REGIME, REGIMES, DATASETS, get_dataset, without_example
 from services.common.logging_utils import log_data
 
 
@@ -89,6 +88,11 @@ def parse_args():
         type=int,
         default=25,
         help="Rows between progress-file updates (default: 25).",
+    )
+    parser.add_argument(
+        "--no-example",
+        action="store_true",
+        help="Drop the example answer from the system prompt; use for models that copy it.",
     )
     parser.add_argument(
         "--overwrite",
@@ -240,9 +244,13 @@ def main():
     model = model.to(device)
     model.eval()
 
+    system_prompt = spec.system_prompt[args.regime]
+    if args.no_example:
+        system_prompt = without_example(system_prompt)
+
     llm_chain = ChatPromptTemplate.from_messages(
         [
-            ("system", spec.system_prompt[args.regime]),
+            ("system", system_prompt),
             ("human", spec.user_prompt[args.regime]),
         ]
     ) | LLMInterface(model=model, tokenizer=tokenizer, device=device)
@@ -343,6 +351,7 @@ def main():
         "model": args.model,
         "dataset": spec.name,
         "regime": args.regime,
+        "prompt_example": not args.no_example,
         "rows_attempted": attempted_rows,
         "rows_accepted": accepted_count,
         "rows_abandoned": len(abandoned_rows),

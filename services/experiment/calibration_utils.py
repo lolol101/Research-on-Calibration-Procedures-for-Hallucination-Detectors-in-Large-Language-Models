@@ -18,7 +18,7 @@ from ..common.calculation_utils import (
     calculate_roc_auc,
 )
 from ..common.calibration_heads import CalibrationHead
-from ..common.training_utils import fit_with_early_stopping
+from ..common.training_utils import fit_stacked_with_early_stopping, fit_with_early_stopping
 from ..common.logging_utils import log_data
 from ..index import IndexDataset
 
@@ -33,7 +33,10 @@ def find_best_layer_head_hdp(
     Selects top attention heads by hallucination–truth score gap (TOHA-style).
 
     For each (layer, head), computes mean attention score on incorrect minus
-    correct answers, then returns the indices with the largest gaps.
+    correct answers, divided by the pooled standard deviation of both groups
+    (Cohen's d), then returns the indices with the largest gaps. Without the
+    division, heads whose entropy is large and widely spread rank high even
+    when the two groups overlap.
 
     Args:
         data: Dict with ``labels`` and ``attn_score{l}_{h}`` tensors per head.
@@ -49,9 +52,18 @@ def find_best_layer_head_hdp(
     hallu_elem_ids = torch.argwhere(data["labels"] == False)
     truth_elem_ids = torch.argwhere(data["labels"] == True)
 
+    hallu_count, truth_count = len(hallu_elem_ids), len(truth_elem_ids)
+
+    def cohens_d(scores):
+        hallu_scores, truth_scores = scores[hallu_elem_ids], scores[truth_elem_ids]
+        pooled_var = (
+            (hallu_count - 1) * hallu_scores.var() + (truth_count - 1) * truth_scores.var()
+        ) / (hallu_count + truth_count - 2)
+        return (hallu_scores.mean() - truth_scores.mean()) / (pooled_var.sqrt() + 1e-12)
+
     hdp_results = torch.stack(
         [
-            data[f"attn_score{l}_{h}"][hallu_elem_ids].mean() - data[f"attn_score{l}_{h}"][truth_elem_ids].mean()
+            cohens_d(data[f"attn_score{l}_{h}"])
             for l in range(layers_count)
                 for h in range(heads_count)
         ]
@@ -123,6 +135,38 @@ def find_best_layer_head_roc_auc(
     
     return best_score_idx // heads_count, best_score_idx % heads_count
 
+def find_random_layer_head(
+    data: dict,
+    layers_count: int,
+    heads_count: int,
+    best_heads_group_size: int,
+    seed: int = 0,
+    verbose: bool = False
+    ):
+    """
+    Draws (layer, head) pairs uniformly at random, ignoring ``data``.
+
+    Ablation for the HDP and ROC AUC criteria: if randomly drawn heads
+    calibrate as well as selected ones, the selection step adds nothing.
+    Leading pairs are kept for smaller groups, so groups are nested as for
+    the ranked criteria.
+
+    Args:
+        data: Head-selection data; unused, kept for the selector interface.
+        layers_count: Number of transformer layers.
+        heads_count: Number of heads per layer.
+        best_heads_group_size: How many (layer, head) pairs to return.
+        seed: Seed of the draw.
+        verbose: Unused, kept for the selector interface.
+
+    Returns:
+        Tuple ``(best_layers, best_heads)`` index tensors of length
+        ``best_heads_group_size``.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    drawn_idx = torch.randperm(layers_count * heads_count, generator=generator)[:best_heads_group_size]
+    return drawn_idx // heads_count, drawn_idx % heads_count
+
 
 def test_calibration_model(
     X_test: torch.Tensor,
@@ -131,17 +175,17 @@ def test_calibration_model(
     verbose: bool = False,
     logging: bool = False,
     log_dir: Optional[str] = None,
-    eps: float = 1e-8,
+    eps: float = 1e-6,
     bootstrap: bool = False,
     n_resamples: int = 1000,
     confidence: float = 0.95,
     random_seed: Optional[int] = None,
+    save_predictions: bool = False,
 ):
     """
     Evaluates calibrated probabilities on a held-out set.
 
-    Same metrics as the baseline helper: ECE, NLL, MSE, accuracy, inverse
-    Brier skill score, and weighted ``ece+inv_bss`` (0.2 BSS + 0.8 ECE).
+    Same metrics as the baseline helper, from ``calculate_calibration_metrics``.
     Optionally adds percentile bootstrap confidence intervals.
 
     Args:
@@ -156,11 +200,13 @@ def test_calibration_model(
         n_resamples: Number of bootstrap resamples.
         confidence: Two-sided coverage of the reported intervals.
         random_seed: Seed for the resampling RNG.
+        save_predictions: If True and ``logging=True``, also save ``X_test``
+            and ``y_test`` to ``test_predictions.pt`` in ``log_dir``.
 
     Returns:
-        Dict with keys ``ece+inv_bss``, ``ece``, ``inv_bss``, ``nlll``,
-        ``mse``, and ``accuracy``, plus ``{metric}_ci_low`` and
-        ``{metric}_ci_high`` entries when ``bootstrap=True``.
+        Dict of the ``calculate_calibration_metrics`` metrics, plus
+        ``{metric}_ci_low`` and ``{metric}_ci_high`` entries when
+        ``bootstrap=True``.
     """
     if logging and not log_dir:
         raise ValueError("logging=True requires log_dir")
@@ -191,7 +237,7 @@ def test_calibration_model(
             metrics[f"{name}_ci_high"] = high
 
     if verbose:
-        for name in ("ece+inv_bss", "ece", "inv_bss", "nlll", "mse", "accuracy"):
+        for name in ("ece", "ce_debiased", "rel", "res", "inv_bss", "nlll", "auroc", "accuracy"):
             line = f"{name} on test data: {metrics[name]}"
             if bootstrap:
                 line += (
@@ -208,6 +254,11 @@ def test_calibration_model(
             extension=".txt",
             separator="=",
         )
+        if save_predictions:
+            torch.save(
+                {"probs": X_test.detach().cpu(), "labels": y_test.detach().cpu()},
+                os.path.join(log_dir, "test_predictions.pt"),
+            )
 
     return metrics
 
@@ -255,7 +306,7 @@ def fit_calibration_model(
     lr_max=1e-2,
     lr_min=1e-4,
     batch_size=64,
-    max_epochs=20,
+    max_epochs=50,
     patience=3,
     shuffle_seed: Optional[int] = None,
     verbose: bool = False,
@@ -340,7 +391,7 @@ def fit_hparameters(
     l1_reg=False,
     l2_reg=False,
     random_seed: Optional[int] = None,
-    max_epochs=20,
+    max_epochs=50,
     patience=3,
     verbose: bool = False,
     logging: bool = False,
@@ -349,9 +400,13 @@ def fit_hparameters(
     """
     Random search over calibration training hyperparameters.
 
-    Samples trials from a grid (optionally including L1/L2), fits with
-    ``fit_calibration_model``, scores via ECE and ``test_calibration_model``,
-    and records SHAP attributions per trial.
+    Samples trials from a grid (optionally including L1/L2), fits them,
+    scores via ECE and ``test_calibration_model``, and records SHAP
+    attributions per trial. Every head standardizes its inputs with the mean
+    and standard deviation of the training features, kept in its state dict.
+    On CUDA the trials of each batch size are trained
+    jointly with ``fit_stacked_with_early_stopping`` (no per-trial loss
+    plots); otherwise each trial is fitted with ``fit_calibration_model``.
 
     Args:
         model_class: ``CalibrationHead`` subclass to instantiate.
@@ -372,7 +427,8 @@ def fit_hparameters(
         logging: Log trials and best hyperparameters under ``log_dir``.
 
     Returns:
-        Best trial dict: ``parameters``, ``hparameters``, ``ece+inv_bss``,
+        Dict of the trial with the lowest validation ``inv_bss``:
+        ``parameters``, ``hparameters``, ``inv_bss``, ``val_metrics``,
         ``shap_values``.
     """
     param_grid = {
@@ -392,40 +448,88 @@ def fit_hparameters(
         extra_ids = rng.integers(0, len(all_candidates), size=search_trials - len(all_candidates))
         sampled_candidates.extend([all_candidates[i] for i in extra_ids.tolist()])
 
-    results = []
-    for trial_idx, sampled in enumerate(tqdm(sampled_candidates, disable=not verbose)):
+    trial_log_dirs = []
+    for trial_idx in range(len(sampled_candidates)):
         trial_log_dir = log_dir
         if logging and log_dir:
             trial_log_dir = os.path.join(log_dir, f"search_iter_{trial_idx + 1}")
             Path(trial_log_dir).mkdir(parents=True, exist_ok=True)
+        trial_log_dirs.append(trial_log_dir)
 
+    # Created in trial order, so both training paths below start every trial
+    # from the same initial weights.
+    models = [
+        model_class(
+            in_features=(features_count + 1) * (heads_count + (not attn_only)),
+            device=device
+        )
+        for _ in sampled_candidates
+    ]
+    # Inputs are standardized with train statistics; constant columns are only centred.
+    train_features = train.get()["features"][:, feature_ids].to(device=device, dtype=torch.float32)
+    input_std = train_features.std(0)
+    input_std = torch.where(input_std > 1e-8, input_std, torch.ones_like(input_std))
+    for model in models:
+        model.set_input_scaling(train_features.mean(0), input_std)
+    best_epochs = [0] * len(sampled_candidates)
+
+    if device.type == "cuda":
+        # Trials that share a batch size are trained jointly: on a GPU one
+        # stacked step costs about as much as a single tiny model's step.
+        train_data, val_data = train.get(), test.get()
+        for batch_size in sorted({int(sampled["batch_size"]) for sampled in sampled_candidates}):
+            trial_ids = [
+                trial_idx
+                for trial_idx, sampled in enumerate(sampled_candidates)
+                if int(sampled["batch_size"]) == batch_size
+            ]
+            group_epochs = fit_stacked_with_early_stopping(
+                [models[trial_idx] for trial_idx in trial_ids],
+                train_data["features"][:, feature_ids].to(device=device, dtype=torch.float32),
+                train_data["labels"].to(device=device, dtype=torch.float32),
+                val_data["features"][:, feature_ids].to(device=device, dtype=torch.float32),
+                val_data["labels"].to(device=device, dtype=torch.float32),
+                lr_max=[float(sampled_candidates[i]["lr_max"]) for i in trial_ids],
+                lr_min=[float(sampled_candidates[i]["lr_min"]) for i in trial_ids],
+                l1_lambda=[float(sampled_candidates[i]["l1_lambda"]) for i in trial_ids],
+                l2_lambda=[float(sampled_candidates[i]["l2_lambda"]) for i in trial_ids],
+                batch_size=batch_size,
+                max_epochs=max_epochs,
+                patience=patience,
+                shuffle_seed=random_seed,
+            )
+            for trial_idx, best_epoch in zip(trial_ids, group_epochs):
+                best_epochs[trial_idx] = best_epoch
+    else:
+        for trial_idx, sampled in enumerate(tqdm(sampled_candidates, disable=not verbose)):
+            _, best_epochs[trial_idx] = fit_calibration_model(
+                models[trial_idx],
+                train=train,
+                test=test,
+                feature_ids=feature_ids,
+                lr_max=float(sampled["lr_max"]),
+                lr_min=float(sampled["lr_min"]),
+                batch_size=int(sampled["batch_size"]),
+                max_epochs=max_epochs,
+                patience=patience,
+                shuffle_seed=random_seed,
+                device=device,
+                verbose=verbose,
+                logging=logging,
+                log_dir=trial_log_dirs[trial_idx],
+                l1_lambda=float(sampled["l1_lambda"]),
+                l2_lambda=float(sampled["l2_lambda"]),
+            )
+
+    results = []
+    for trial_idx, (model, sampled) in enumerate(zip(models, sampled_candidates)):
+        trial_log_dir = trial_log_dirs[trial_idx]
         lr_max = float(sampled["lr_max"])
         lr_min = float(sampled["lr_min"])
         batch_size = int(sampled["batch_size"])
         l1_lambda = float(sampled["l1_lambda"])
         l2_lambda = float(sampled["l2_lambda"])
-
-        model, best_epoch = fit_calibration_model(
-            model_class(
-                in_features=(features_count + 1) * (heads_count + (not attn_only)),
-                device=device
-            ),
-            train=train,
-            test=test,
-            feature_ids=feature_ids,
-            lr_max=lr_max,
-            lr_min=lr_min,
-            batch_size=batch_size,
-            max_epochs=max_epochs,
-            patience=patience,
-            shuffle_seed=random_seed,
-            device=device,
-            verbose=verbose,
-            logging=logging,
-            log_dir=trial_log_dir,
-            l1_lambda=l1_lambda,
-            l2_lambda=l2_lambda,
-        )
+        best_epoch = best_epochs[trial_idx]
 
         test_data = test.get()
         test_data_features = test_data.get("features")[:, feature_ids].to(device=device, dtype=torch.float32)
@@ -470,12 +574,13 @@ def fit_hparameters(
                     "l1_lambda": l1_lambda,
                     "l2_lambda": l2_lambda,
                 },
-                "ece+inv_bss": metrics["ece+inv_bss"],
+                "inv_bss": metrics["inv_bss"],
+                "val_metrics": metrics,
                 "shap_values": trial_shap_values,
             }
         )
 
-    best_result = min(results, key=lambda x: x["ece+inv_bss"])
+    best_result = min(results, key=lambda x: x["inv_bss"])
     if logging and log_dir:
         best_shap_values = best_result.get("shap_values")
         if best_shap_values is not None:
@@ -494,8 +599,9 @@ def fit_hparameters(
 
         log_data(
             data={
-                "ece+inv_bss": best_result["ece+inv_bss"],
+                "inv_bss": best_result["inv_bss"],
                 **best_result["hparameters"],
+                **{f"val_{name}": value for name, value in best_result["val_metrics"].items()},
             },
             log_dir=log_dir,
             prefix="best_model_hparameters",

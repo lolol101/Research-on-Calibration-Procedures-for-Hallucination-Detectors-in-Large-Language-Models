@@ -1,13 +1,34 @@
 import os
 import torch
 from matplotlib import pyplot as plt
-import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 from pathlib import Path
 from typing import Optional
 from torch import nn
 from tqdm import tqdm
 from .logging_utils import log_data, make_next_indexed_log_filename
+
+def adaptive_bin_ids(sorted_probs: torch.Tensor, n_bins: int, device: torch.device) -> torch.Tensor:
+    """
+    Equal-count bin of every sample, assigned by value.
+
+    Bin edges are the empirical quantiles ``k / n_bins`` of the confidences.
+    Samples with equal confidence always share a bin: a tie group crossing a
+    quantile goes whole to the upper bin, so the binning does not depend on
+    how the sort orders ties. Without ties the bins are of equal size.
+
+    Args:
+        sorted_probs: Predicted probabilities sorted in ascending order.
+        n_bins: Number of bins.
+        device: torch.device to perform computations on.
+
+    Returns:
+        Bin index in ``[0, n_bins)`` of every sample, aligned with ``sorted_probs``.
+    """
+    bin_size = len(sorted_probs) // n_bins
+    # Lower edge of every bin after the first: the confidence at rank k * bin_size.
+    edges = sorted_probs[torch.arange(1, n_bins, device=device) * bin_size] # [n_bins - 1]
+    return torch.bucketize(sorted_probs, edges, right=True) # [N]
 
 def calculate_ece_adaptive_bins(
     token_probs: torch.Tensor,
@@ -22,9 +43,9 @@ def calculate_ece_adaptive_bins(
     """
     Expected calibration error with equal-count (adaptive) bins.
 
-    Sorts samples by confidence, splits into ``n_bins`` groups of equal size,
-    and sums ``|avg_confidence - accuracy| * proportion``. Optionally plots
-    a reliability diagram.
+    Bins samples with ``adaptive_bin_ids`` (empirical quantiles, ties never
+    split) and sums ``|avg_confidence - accuracy| * proportion``. Optionally
+    plots a reliability diagram.
 
     Args:
         token_probs: Predicted probabilities.
@@ -50,7 +71,7 @@ def calculate_ece_adaptive_bins(
     sorted_labels = labels[sorted_indices]
 
     n_samples = len(sorted_probs)
-    bin_size = n_samples // n_bins
+    bin_ids = adaptive_bin_ids(sorted_probs, n_bins, device) # [N]
 
     ece = torch.zeros(1, device=device)
 
@@ -60,14 +81,14 @@ def calculate_ece_adaptive_bins(
     bin_conf_max = []
 
     for i in range(n_bins):
-        start_idx = i * bin_size
-        end_idx = n_samples if i == n_bins - 1 else (i + 1) * bin_size
+        in_bin = bin_ids == i
+        bin_count = int(in_bin.sum())
 
-        if end_idx > start_idx:
-            bin_probs = sorted_probs[start_idx:end_idx]
-            bin_accuracies = sorted_labels[start_idx:end_idx]
+        if bin_count > 0:
+            bin_probs = sorted_probs[in_bin]
+            bin_accuracies = sorted_labels[in_bin]
 
-            prop_in_bin = (end_idx - start_idx) / n_samples
+            prop_in_bin = bin_count / n_samples
 
             accuracy_in_bin = bin_accuracies.float().mean()
             avg_confidence_in_bin = bin_probs.mean()
@@ -131,137 +152,75 @@ def calculate_ece_adaptive_bins(
 
     return ece.item()
 
-def calculate_ece_fixed_bins(
+def calculate_brier_decomposition(
     token_probs: torch.Tensor,
     labels: torch.Tensor,
     device: torch.device,
     n_bins: int = 10,
-    verbose: bool = False,
-    logging: bool = False,
-    log_dir: Optional[str] = None,
-    log_filename: Optional[str] = None,
 ):
     """
-    Expected calibration error with uniform-width bins on [0, 1].
+    Murphy decomposition of the Brier score with bias-corrected terms.
+
+    Over the ``adaptive_bin_ids`` bins, ``Brier ~ REL - RES + UNC``:
+
+    - ``rel`` (reliability): ``sum_b w_b (acc_b - conf_b)^2``, the squared
+      calibration error; lower is better.
+    - ``res`` (resolution): ``sum_b w_b (acc_b - acc)^2``, how far the
+      accuracy of the bins spreads around the base rate; higher is better.
+    - ``unc`` (uncertainty): ``acc (1 - acc)``, set by the data alone.
+
+    A bin's observed accuracy is noisy, which inflates both plug-in sums by
+    its sampling variance; following Kumar, Liang and Ma (2019, "Verified
+    Uncertainty Calibration") the estimate ``acc_b (1 - acc_b) / (n_b - 1)``
+    is subtracted per bin. The same term enters ``rel`` and ``res``, so
+    ``rel - res`` is unchanged, while small and large bins are compared on
+    equal terms. The corrected sums may dip slightly below zero.
+    ``ce_debiased = sqrt(max(rel, 0))`` is the debiased L2 calibration error
+    on the probability scale.
 
     Args:
         token_probs: Predicted probabilities.
         labels: Binary labels (0/1).
-        device: Device for masks and ECE accumulation.
-        n_bins: Number of fixed-width bins.
-        verbose: Show the reliability plot.
-        logging: Save the plot PNG to ``log_dir``.
-        log_dir: Directory for logged figures.
-        log_filename: Override auto-generated PNG name.
+        device: torch.device to perform computations on.
+        n_bins: Number of adaptive bins.
 
     Returns:
-        ECE as a Python float.
+        Dict with ``ce_debiased``, ``rel``, ``res`` and ``unc`` as Python floats.
     """
-    if logging and not log_dir:
-        raise ValueError("logging=True requires log_dir")
+    probs = token_probs.to(device=device, dtype=torch.float64)
+    labels_f = labels.to(device=device, dtype=torch.float64)
+    order = torch.argsort(probs)
+    sorted_probs, sorted_labels = probs[order], labels_f[order]
+    bin_ids = adaptive_bin_ids(sorted_probs, n_bins, device) # [N]
 
-    token_probs = token_probs.to(device)
-    labels = labels.to(device)
+    counts = torch.bincount(bin_ids, minlength=n_bins).to(torch.float64) # [n_bins]
+    conf_sums = torch.bincount(bin_ids, weights=sorted_probs, minlength=n_bins) # [n_bins]
+    acc_sums = torch.bincount(bin_ids, weights=sorted_labels, minlength=n_bins) # [n_bins]
+    filled = counts > 0
+    counts = counts[filled]
+    conf = conf_sums[filled] / counts
+    acc = acc_sums[filled] / counts
+    weights = counts / len(sorted_probs)
+    base_rate = sorted_labels.mean()
 
-    n_samples = token_probs.numel()
-    ece = torch.zeros(1, device=device)
+    noise = acc * (1 - acc) / (counts - 1).clamp_min(1) # [bins]; 0 for single-sample bins
+    rel = (weights * ((acc - conf) ** 2 - noise)).sum()
+    res = (weights * ((acc - base_rate) ** 2 - noise)).sum()
+    unc = base_rate * (1 - base_rate)
 
-    bin_avg_confidences = []
-    bin_accuracies_list = []
-    bin_conf_min = []
-    bin_conf_max = []
-
-    bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=device)
-
-    for i in range(n_bins):
-        if i < n_bins - 1:
-            bin_mask = (token_probs >= bin_boundaries[i]) & (token_probs < bin_boundaries[i + 1])
-        else:
-            bin_mask = (token_probs >= bin_boundaries[i]) & (token_probs <= bin_boundaries[i + 1])
-
-        bin_count = int(bin_mask.sum().item())
-        if bin_count == 0:
-            continue
-
-        bin_probs = token_probs[bin_mask]
-        bin_accuracies = labels[bin_mask]
-
-        prop_in_bin = bin_count / float(n_samples)
-
-        accuracy_in_bin = bin_accuracies.float().mean()
-        avg_confidence_in_bin = bin_probs.mean()
-
-        ece += torch.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
-
-        if verbose or logging:
-            bin_avg_confidences.append(avg_confidence_in_bin.detach().cpu())
-            bin_accuracies_list.append(accuracy_in_bin.detach().cpu())
-            bin_conf_min.append(bin_probs.min().detach().cpu())
-            bin_conf_max.append(bin_probs.max().detach().cpu())
-
-    if verbose or logging:
-        if len(bin_accuracies_list) == 0:
-            if verbose:
-                plt.show()
-            return ece.item()
-
-        bin_avg_confidences = torch.stack(bin_avg_confidences).numpy()
-        bin_accuracies_list = torch.stack(bin_accuracies_list).numpy()
-        bin_conf_min = torch.stack(bin_conf_min).numpy()
-        bin_conf_max = torch.stack(bin_conf_max).numpy()
-
-        fig, ax = plt.subplots(figsize=(6, 6))
-
-        ax.plot([0, 1], [0, 1], linestyle="--", color="gray", label="Perfect calibration")
-        ax.plot(
-            bin_avg_confidences,
-            bin_accuracies_list,
-            marker="o",
-            linewidth=2,
-            label="Model (fixed bins)",
-        )
-
-        for i in range(len(bin_accuracies_list)):
-            ax.fill_between(
-                [
-                    bin_conf_min[i] if i > 0 else 0,
-                    bin_conf_max[i] if i < len(bin_accuracies_list) - 1 else 1,
-                ],
-                0,
-                bin_accuracies_list[i] + 0.005,
-                alpha=0.4,
-            )
-
-        ax.set_xlabel("Confidence")
-        ax.set_ylabel("Accuracy")
-        ax.set_title("Reliability Diagram with Fixed Bin Coverage")
-        ax.grid(True)
-        ax.legend()
-        fig.tight_layout()
-
-        if logging:
-            Path(log_dir).mkdir(parents=True, exist_ok=True)
-            fname = log_filename or make_next_indexed_log_filename(
-                log_dir=log_dir,
-                prefix="ece_fixed_bins",
-                extension=".png",
-            )
-            out_path = os.path.join(log_dir, fname)
-            fig.savefig(out_path, dpi=200, bbox_inches="tight")
-
-        if verbose:
-            plt.show()
-
-        plt.close(fig)
-
-    return ece.item()
+    return {
+        "ce_debiased": rel.clamp_min(0).sqrt().item(),
+        "rel": rel.item(),
+        "res": res.item(),
+        "unc": unc.item(),
+    }
 
 def calculate_calibration_metrics(
     token_probs: torch.Tensor,
     labels: torch.Tensor,
     device: torch.device,
     n_bins: int = 10,
-    eps: float = 1e-8,
+    eps: float = 1e-6,
     verbose: bool = False,
     logging: bool = False,
     log_dir: Optional[str] = None,
@@ -283,8 +242,9 @@ def calculate_calibration_metrics(
         log_dir: Directory for logged figures; required when ``logging=True``.
 
     Returns:
-        Dict with ``ece+inv_bss``, ``ece``, ``inv_bss``, ``nlll``, ``mse``
-        and ``accuracy`` as Python floats.
+        Dict with ``ece``, the ``calculate_brier_decomposition`` terms
+        (``ce_debiased``, ``rel``, ``res``, ``unc``), ``inv_bss``, ``nlll``,
+        ``mse``, ``auroc`` and ``accuracy`` as Python floats.
     """
     if logging and not log_dir:
         raise ValueError("logging=True requires log_dir")
@@ -313,14 +273,13 @@ def calculate_calibration_metrics(
         (mse / brier_score_ref).item() if brier_score_ref > eps else float("nan")
     )
 
-    w_bss, w_ece = 0.2, 0.8
-
     return {
-        "ece+inv_bss": w_bss * inv_brier_skill_score + w_ece * ece_value,
         "ece": ece_value,
+        **calculate_brier_decomposition(token_probs, labels, device=device, n_bins=n_bins),
         "inv_bss": inv_brier_skill_score,
         "nlll": nlll.item(),
         "mse": mse.item(),
+        "auroc": calculate_roc_auc(probs, labels_f) if 0 < accuracy < 1 else float("nan"),
         "accuracy": accuracy.item(),
     }
 
@@ -332,7 +291,7 @@ def calculate_metrics_bootstrap_ci(
     confidence: float = 0.95,
     random_seed: Optional[int] = None,
     n_bins: int = 10,
-    eps: float = 1e-8,
+    eps: float = 1e-6,
     verbose: bool = False,
 ):
     """

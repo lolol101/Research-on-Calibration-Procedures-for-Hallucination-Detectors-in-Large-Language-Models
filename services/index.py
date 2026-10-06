@@ -157,7 +157,7 @@ def _split_rank(seed, row_id):
     return int.from_bytes(digest, "big")
 
 
-def split_positions(index, split, train_split=0.8, val_split=0.9, split_seed=None):
+def split_positions(index, split, train_split=0.6, val_split=0.8, split_seed=None):
     """Record positions of one train/val/test split, in split order.
 
     Args:
@@ -197,8 +197,8 @@ class IndexDataset(Dataset):
         process_elements=lambda x, y: (x, y),
         split="train",
         load_all_data=False,
-        train_split=0.8,
-        val_split=0.9,
+        train_split=0.6,
+        val_split=0.8,
         split_seed=None,
         verbose=False
     ):
@@ -209,8 +209,8 @@ class IndexDataset(Dataset):
             process_elements: Callable ``(index_data, **kwargs) -> dict`` of tensors used by ``get`` / ``_load_data`` function.
             split: One of ``"train"``, ``"val"``, or ``"test"``.
             load_all_data: If True, preprocess the full split at init time.
-            train_split: Fraction of records for training (default 0.8).
-            val_split: Upper fraction bound for validation (default 0.9).
+            train_split: Fraction of records for training (default 0.6).
+            val_split: Upper fraction bound for validation (default 0.8).
             split_seed: If set, records are shuffled before splitting;
                 ``None`` keeps the contiguous storage order.
             verbose: Passed to ``Index.load_records`` and ``process_elements``.

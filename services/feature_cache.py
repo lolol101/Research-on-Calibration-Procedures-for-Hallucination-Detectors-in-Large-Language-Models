@@ -207,7 +207,9 @@ class FeatureCache:
         rows = self._rows("val", split_seed)
         if hs_size > 0:
             rows = rows[:hs_size]
-        entropy = self.attention_entropy[rows].to(device) # [B, L, H]
+        # Stored in bfloat16; selection statistics are averaged in float32, or
+        # most heads tie at bfloat16 resolution.
+        entropy = self.attention_entropy[rows].to(device, torch.float32) # [B, L, H]
         data = {"labels": self.labels[rows].to(device)}
         for l in range(entropy.shape[1]):
             for h in range(entropy.shape[2]):

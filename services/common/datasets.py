@@ -5,7 +5,7 @@ benchmark means adding one entry to :data:`DATASETS` rather than editing the
 data-processing helpers.
 
 The MMLU-Pro prompts reproduce, byte for byte, the ones used by the original
-launch notebooks under ``legacy/launches/``: responses collected by
+launch notebooks (removed; see the git history): responses collected by
 ``tasks/launch.py`` must stay comparable with the data already stored
 in ``index_data/``. Their indentation and trailing spaces come from the
 triple-quoted literals in those notebooks and are kept deliberately, since they
@@ -25,6 +25,7 @@ article, so data collected with this spec is not comparable to the indices the
 notebooks produced.
 """
 
+import re
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional
 
@@ -267,6 +268,25 @@ HELLASWAG_COT_USER_PROMPT = """
             Options:
             {input_options}
             """
+
+
+# The block from an "Example:" line through the blank line that ends it.
+EXAMPLE_BLOCK = re.compile(r"[ \t]*Example:\n(?:[ \t]*\S.*\n)*[ \t]*\n")
+
+
+def without_example(system_prompt: str) -> str:
+    """Drop the ``Example:`` block from a system prompt.
+
+    Every example answers with option 2, and weaker models copy it instead of
+    answering the question.
+
+    Args:
+        system_prompt: A system prompt from :data:`DATASETS`.
+
+    Returns:
+        The prompt with its example block removed.
+    """
+    return EXAMPLE_BLOCK.sub("", system_prompt)
 
 
 def _format_options(options) -> list:

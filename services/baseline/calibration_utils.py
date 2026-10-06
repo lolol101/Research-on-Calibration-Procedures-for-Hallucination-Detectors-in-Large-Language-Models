@@ -4,7 +4,10 @@ from typing import Literal, Optional
 
 import numpy as np
 import seaborn as sns
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import ParameterGrid
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 import torch
 from torch import nn
 from tqdm import tqdm
@@ -28,19 +31,20 @@ def test_calibration_model(
     verbose: bool = False,
     logging: bool = False,
     log_dir: Optional[str] = None,
-    eps: float = 1e-8,
+    eps: float = 1e-6,
     bootstrap: bool = False,
     n_resamples: int = 1000,
     confidence: float = 0.95,
     random_seed: Optional[int] = None,
+    save_predictions: bool = False,
 ):
     """
     Calculates set of metrics on the calibrated probabilities.
 
-    Computes ECE (adaptive bins), negative log-likelihood, MSE, accuracy,
-    inverse Brier skill score, and a weighted composite ``ece+inv_bss``
-    (0.2 * inv_bss + 0.8 * ece). Optionally adds percentile bootstrap
-    confidence intervals for every metric.
+    Computes the metrics of ``calculate_calibration_metrics`` (ECE, the
+    debiased Brier decomposition, inverse Brier skill score, NLL, MSE, AUROC
+    and accuracy). Optionally adds percentile bootstrap confidence intervals
+    for every metric.
 
     Args:
         X_test: Predicted probabilities.
@@ -54,11 +58,13 @@ def test_calibration_model(
         n_resamples: Number of bootstrap resamples.
         confidence: Two-sided coverage of the reported intervals.
         random_seed: Seed for the resampling RNG.
+        save_predictions: If True and ``logging=True``, also save ``X_test``
+            and ``y_test`` to ``test_predictions.pt`` in ``log_dir``.
 
     Returns:
-        Dict with keys ``ece+inv_bss``, ``ece``, ``inv_bss``, ``nlll``,
-        ``mse``, and ``accuracy`` (scalar floats), plus ``{metric}_ci_low``
-        and ``{metric}_ci_high`` entries when ``bootstrap=True``.
+        Dict of the ``calculate_calibration_metrics`` metrics (scalar
+        floats), plus ``{metric}_ci_low`` and ``{metric}_ci_high`` entries
+        when ``bootstrap=True``.
     """
     if logging and not log_dir:
         raise ValueError("logging=True requires log_dir")
@@ -89,7 +95,7 @@ def test_calibration_model(
             metrics[f"{name}_ci_high"] = high
 
     if verbose:
-        for name in ("ece+inv_bss", "ece", "inv_bss", "nlll", "mse", "accuracy"):
+        for name in ("ece", "ce_debiased", "rel", "res", "inv_bss", "nlll", "auroc", "accuracy"):
             line = f"{name} on test data: {metrics[name]}"
             if bootstrap:
                 line += (
@@ -106,6 +112,11 @@ def test_calibration_model(
             extension=".txt",
             separator="=",
         )
+        if save_predictions:
+            torch.save(
+                {"probs": X_test.detach().cpu(), "labels": y_test.detach().cpu()},
+                os.path.join(log_dir, "test_predictions.pt"),
+            )
 
     return metrics
 
@@ -118,7 +129,7 @@ def fit_calibration_model_beta(
     lr_max=1e-2,
     lr_min=1e-4,
     batch_size=64,
-    max_epochs=20,
+    max_epochs=50,
     patience=3,
     shuffle_seed: Optional[int] = None,
     verbose: bool = False,
@@ -187,7 +198,7 @@ def fit_calibration_model_temp(
     lr_max=1e-2,
     lr_min=1e-4,
     batch_size=64,
-    max_epochs=20,
+    max_epochs=50,
     patience=3,
     shuffle_seed: Optional[int] = None,
     verbose: bool = False,
@@ -256,7 +267,7 @@ def fit_hparameters_beta(
     device: torch.device,
     search_trials=20,
     random_seed: Optional[int] = None,
-    max_epochs=20,
+    max_epochs=50,
     patience=3,
     verbose: bool = False,
     logging: bool = False,
@@ -287,7 +298,8 @@ def fit_hparameters_beta(
 
     Returns:
         Dict with ``hparameters``, best model ``parameters`` (state dict),
-        ``ece+inv_bss`` and ``shap_values`` from the best trial.
+        validation ``inv_bss`` and ``shap_values`` from the trial with the
+        lowest validation ``inv_bss``.
     """
     param_grid = {
         "lr_max": [1e-2, 5e-3, 2e-3, 1e-3],
@@ -374,12 +386,13 @@ def fit_hparameters_beta(
                     "best_epoch": best_epoch,
                 },
                 "parameters": model.state_dict(),
-                "ece+inv_bss": metrics["ece+inv_bss"],
+                "inv_bss": metrics["inv_bss"],
+                "val_metrics": metrics,
                 "shap_values": trial_shap_values,
             }
         )
 
-    best_result = min(results, key=lambda x: x["ece+inv_bss"])
+    best_result = min(results, key=lambda x: x["inv_bss"])
     if logging and log_dir:
         best_shap_values = best_result.get("shap_values")
         if best_shap_values is not None:
@@ -398,8 +411,9 @@ def fit_hparameters_beta(
 
         log_data(
             data={
-                "ece+inv_bss": best_result["ece+inv_bss"],
+                "inv_bss": best_result["inv_bss"],
                 **best_result["hparameters"],
+                **{f"val_{name}": value for name, value in best_result["val_metrics"].items()},
             },
             log_dir=log_dir,
             prefix="best_model_hparameters",
@@ -416,7 +430,7 @@ def fit_hparameters_temp(
     device: torch.device,
     search_trials=20,
     random_seed: Optional[int] = None,
-    max_epochs=20,
+    max_epochs=50,
     patience=3,
     verbose: bool = False,
     logging: bool = False,
@@ -426,7 +440,7 @@ def fit_hparameters_temp(
 
     Same search procedure as ``fit_hparameters_beta``, but uses
     ``fit_calibration_model_temp`` and evaluates calibrated token probabilities
-    at ``gen_tok_ids`` positions before computing ECE and composite metrics.
+    at ``gen_tok_ids`` positions before computing the metrics.
 
     Args:
         model_class: ``CalibrationHead`` subclass to instantiate per trial.
@@ -445,7 +459,8 @@ def fit_hparameters_temp(
 
     Returns:
         Dict with ``hparameters``, best model ``parameters`` (state dict),
-        ``ece+inv_bss`` and ``shap_values`` from the best trial.
+        validation ``inv_bss`` and ``shap_values`` from the trial with the
+        lowest validation ``inv_bss``.
     """
     param_grid = {
         "lr_max": [1e-2, 5e-3, 2e-3, 1e-3],
@@ -527,16 +542,85 @@ def fit_hparameters_temp(
                     "best_epoch": best_epoch,
                 },
                 "parameters": model.state_dict(),
-                "ece+inv_bss": metrics["ece+inv_bss"],
+                "inv_bss": metrics["inv_bss"],
+                "val_metrics": metrics,
             }
         )
 
-    best_result = min(results, key=lambda x: x["ece+inv_bss"])
+    best_result = min(results, key=lambda x: x["inv_bss"])
     if logging and log_dir:
         log_data(
             data={
-                "ece+inv_bss": best_result["ece+inv_bss"],
+                "inv_bss": best_result["inv_bss"],
                 **best_result["hparameters"],
+                **{f"val_{name}": value for name, value in best_result["val_metrics"].items()},
+            },
+            log_dir=log_dir,
+            prefix="best_model_hparameters",
+            extension=".txt",
+            separator="=",
+        )
+    return best_result
+
+
+def fit_logistic_regression(
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    X_val: torch.Tensor,
+    y_val: torch.Tensor,
+    device: torch.device,
+    c_grid=(1e-3, 1e-2, 1e-1, 1.0),
+    penalty: Literal["l1", "l2"] = "l1",
+    logging: bool = False,
+    log_dir: Optional[str] = None,
+):
+    """
+    Logistic regression on standardized features, with ``C`` chosen on validation.
+
+    Used for Platt scaling (one feature, weak L2 penalty) and for the
+    no-selection baseline (all attention heads, L1 penalty). Every ``C`` in
+    ``c_grid`` is fitted on the training set; the one with the lowest
+    validation ``inv_bss`` is kept, as for the gradient-trained heads.
+
+    Args:
+        X_train: Training features, shape ``[B, F]``.
+        y_train: Training labels (0/1), shape ``[B]``.
+        X_val: Validation features, shape ``[B_val, F]``.
+        y_val: Validation labels (0/1), shape ``[B_val]``.
+        device: torch.device for metric computation.
+        c_grid: Inverse regularization strengths to try.
+        penalty: ``"l1"`` or ``"l2"``.
+        logging: If True, write the chosen ``C`` and validation metrics to ``log_dir``.
+        log_dir: Directory for the log; required when ``logging=True``.
+
+    Returns:
+        Dict with the fitted ``model`` (scikit-learn pipeline), its ``C`` and
+        ``val_metrics``.
+
+    Raises:
+        ValueError: If ``logging=True`` and ``log_dir`` is not set.
+    """
+    if logging and not log_dir:
+        raise ValueError("log_dir must be set when logging=True")
+
+    results = []
+    for c in c_grid:
+        model = make_pipeline(
+            StandardScaler(),
+            LogisticRegression(penalty=penalty, C=c, solver="liblinear", max_iter=1000, random_state=0),
+        )
+        model.fit(X_train.cpu().numpy(), y_train.cpu().numpy())
+        val_probs = torch.from_numpy(model.predict_proba(X_val.cpu().numpy())[:, 1]).to(torch.float32)
+        metrics = calculate_calibration_metrics(val_probs, y_val.cpu(), device=device)
+        results.append({"model": model, "C": c, "val_metrics": metrics})
+
+    best_result = min(results, key=lambda x: x["val_metrics"]["inv_bss"])
+    if logging:
+        log_data(
+            data={
+                "inv_bss": best_result["val_metrics"]["inv_bss"],
+                "C": best_result["C"],
+                **{f"val_{name}": value for name, value in best_result["val_metrics"].items()},
             },
             log_dir=log_dir,
             prefix="best_model_hparameters",

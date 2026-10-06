@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Optional, Sequence
 
 import torch
@@ -14,6 +15,7 @@ from ..feature_cache import FeatureCache
 from .calibration_utils import (
     find_best_layer_head_hdp,
     find_best_layer_head_roc_auc,
+    find_random_layer_head,
     fit_hparameters,
     test_calibration_model,
 )
@@ -46,6 +48,10 @@ def select_heads(
     """
     Ranks attention heads on the val split by every criterion in ``HEAD_SELECTORS``.
 
+    When the whole val split is used (``hs_size=0``), a ``random`` draw of
+    heads is added as an ablation; it does not depend on the selection
+    sample, so it is evaluated once rather than for every ``hs_size``.
+
     Args:
         cache: ``FeatureCache`` of the index to calibrate.
         best_heads_group_size: How many (layer, head) pairs to keep.
@@ -60,6 +66,12 @@ def select_heads(
     _, layers_count, heads_count = cache.attention_entropy.shape # [N, L, H]
     head_selection_data = cache.head_selection_data(hs_size, device, split_seed=split_seed)
 
+    selectors = dict(HEAD_SELECTORS)
+    if hs_size == 0:
+        selectors["random"] = partial(
+            find_random_layer_head, seed=0 if split_seed is None else split_seed
+        )
+
     return {
         name: selector(
             data=head_selection_data,
@@ -67,7 +79,7 @@ def select_heads(
             heads_count=heads_count,
             best_heads_group_size=best_heads_group_size,
         )
-        for name, selector in HEAD_SELECTORS.items()
+        for name, selector in selectors.items()
     }
 
 
@@ -76,6 +88,7 @@ def run_experiment_calibrations(
     regime: str,
     device: torch.device,
     attn_only: bool = False,
+    answer_only: bool = False,
     hs_size: int = 50,
     best_heads_group_size: int = 30,
     heads_group_sizes: Sequence[int] = (1, 3, 5, 7, 10, 15, 20, 30),
@@ -92,8 +105,7 @@ def run_experiment_calibrations(
     """
     Runs head selection and attention-based calibration on one index.
 
-    Mirrors the notebooks under ``legacy/experiment_calibrations/``: for every
-    head-selection criterion and calibration head, fits on the train split,
+    For every head-selection criterion and calibration head, fits on the train split,
     chooses hyperparameters on the val split, and evaluates on the test split
     once per number of selected heads.
 
@@ -102,6 +114,9 @@ def run_experiment_calibrations(
         regime: ``"cot"`` or ``"cropped"``.
         device: torch.device to perform computations on.
         attn_only: If True, omit final-token confidence features.
+        answer_only: CoT only; if True, keep the answer-token scores and drop
+            the reasoning-span statistics, so the two feature sets can be
+            compared on the same records.
         hs_size: Number of leading val records used for head selection; 0 uses all.
         best_heads_group_size: How many (layer, head) pairs to select.
         heads_group_sizes: Numbers of best heads fed to the calibration head.
@@ -122,11 +137,14 @@ def run_experiment_calibrations(
         with the test metrics returned by ``test_calibration_model``.
 
     Raises:
-        ValueError: If ``logging=True`` and ``log_dir`` is not set, or a value
-            in ``heads_group_sizes`` exceeds ``best_heads_group_size``.
+        ValueError: If ``logging=True`` and ``log_dir`` is not set, a value
+            in ``heads_group_sizes`` exceeds ``best_heads_group_size``, or
+            ``answer_only`` is set outside the CoT regime.
     """
     if logging and not log_dir:
         raise ValueError("log_dir must be set when logging=True")
+    if answer_only and regime != COT_REGIME:
+        raise ValueError("answer_only applies to the CoT regime only")
     if max(heads_group_sizes) > best_heads_group_size:
         raise ValueError(
             f"heads_group_sizes {list(heads_group_sizes)} exceed "
@@ -135,6 +153,10 @@ def run_experiment_calibrations(
 
     features_count = FEATURES_COUNT[regime]
     block_size = best_heads_group_size + (not attn_only)
+    # The answer-token scores are the last of the ``features_count + 1`` blocks.
+    blocks = [features_count] if answer_only else range(features_count + 1)
+    if answer_only:
+        features_count = 0
 
     selected_heads = select_heads(
         cache=cache,
@@ -178,16 +200,16 @@ def run_experiment_calibrations(
                 heads_group_sizes,
                 desc=f"{head_name} / {selector_name}: calibrating with various heads",
             ):
-                # Leading ``group_size`` score columns of each of the
-                # ``features_count + 1`` blocks of width ``block_size``.
+                # Leading ``group_size`` score columns of each used block of
+                # width ``block_size``.
                 feature_ids = torch.cat([
                     torch.arange(
                         k * block_size,
                         k * block_size + (group_size + (not attn_only)),
                         dtype=torch.long,
                     )
-                    for k in range(features_count + 1)
-                ]) # [(FEATURES_COUNT + 1) * (group_size + (not ATTN_ONLY))]
+                    for k in blocks
+                ]) # [len(blocks) * (group_size + (not ATTN_ONLY))]
 
                 fit_results = fit_hparameters(
                     model_class=head_class,
@@ -224,6 +246,8 @@ def run_experiment_calibrations(
                     logging=logging,
                     log_dir=local_log_dir + f"test#{group_size}" if logging else None,
                     bootstrap=bootstrap,
+                    random_seed=search_seed,
+                    save_predictions=True,
                 )
 
     return results

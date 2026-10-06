@@ -21,6 +21,32 @@ class CalibrationHead(nn.Module, ABC):
         """Map raw features to calibrated outputs."""
         raise NotImplementedError
 
+    def register_input_scaling(self):
+        """Add input standardization buffers, initialised to the identity.
+
+        Calibration features lie in ``[0, 1]`` but vary across records on
+        small and very different scales, so heads that consume them
+        standardize every column first. The statistics are buffers: they
+        travel with the state dict to every split the head is applied to.
+        """
+        self.register_buffer("input_mean", torch.zeros(self.in_features, device=self.device))
+        self.register_buffer("input_std", torch.ones(self.in_features, device=self.device))
+
+    def set_input_scaling(self, mean: torch.Tensor, std: torch.Tensor):
+        """Standardize inputs as ``(features - mean) / std``.
+
+        Args:
+            mean: Per-feature mean, estimated on the training split.
+            std: Per-feature standard deviation; must be positive.
+        """
+        with torch.no_grad():
+            self.input_mean.copy_(mean.to(self.input_mean))
+            self.input_std.copy_(std.to(self.input_std))
+
+    def scale_inputs(self, features: torch.Tensor) -> torch.Tensor:
+        """Apply the standardization of ``set_input_scaling``."""
+        return (features - self.input_mean) / self.input_std
+
     def calibrate(self, features: torch.Tensor, device=torch.device("cpu")) -> torch.Tensor:
         """Run ``forward`` in eval mode without gradients.
 
@@ -38,7 +64,7 @@ class CalibrationHead(nn.Module, ABC):
 class MLPCalibrationHead(CalibrationHead):
     """MLP: attention (+ optional final) features -> sigmoid calibrated probability."""
 
-    def __init__(self, in_features: int, device: torch.device, hidden_dim: int = 32, eps=1e-8):
+    def __init__(self, in_features: int, device: torch.device, hidden_dim: int = 32, eps=1e-6):
         """
         Build a two-hidden-layer MLP with sigmoid output.
 
@@ -46,13 +72,15 @@ class MLPCalibrationHead(CalibrationHead):
             in_features: Input feature dimension.
             device: Parameter device.
             hidden_dim: Width of hidden layers.
-            eps: Clamping bound for output probabilities.
+            eps: Clamping bound for output probabilities; ``1 - eps`` must stay
+                below 1 in float32.
         """
         super().__init__(in_features, device)
         
         self.eps = eps
         self.in_features = in_features
         self.device = device
+        self.register_input_scaling()
         
         # MLP
         self.net = nn.Sequential(
@@ -66,7 +94,7 @@ class MLPCalibrationHead(CalibrationHead):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """Return clamped MLP confidence for each row of ``features``."""
-        calibrated_confidence = self.net(features).squeeze(-1)
+        calibrated_confidence = self.net(self.scale_inputs(features)).squeeze(-1)
         calibrated_confidence = torch.clamp(calibrated_confidence, self.eps, 1 - self.eps)
         return calibrated_confidence
 
@@ -74,20 +102,22 @@ class MLPCalibrationHead(CalibrationHead):
 class MLPBetaCalibrationHead(CalibrationHead):
     """MLP sigmoid confidence followed by beta calibration."""
 
-    def __init__(self, in_features: int, device: torch.device, hidden_dim: int = 32, eps=1e-8):
+    def __init__(self, in_features: int, device: torch.device, hidden_dim: int = 32, eps=1e-6):
         """Initialize MLP trunk and learnable beta parameters ``a``, ``b``, ``c``.
 
         Args:
             in_features: Input feature dimension.
             device: Parameter device.
             hidden_dim: MLP hidden width.
-            eps: Clamping bound before beta mapping.
+            eps: Clamping bound before beta mapping; ``1 - eps`` must stay
+                below 1 in float32, or ``log(1 - p)`` becomes ``-inf``.
         """
         super().__init__(in_features, device)
         
         self.eps = eps
         self.in_features = in_features
         self.device = device
+        self.register_input_scaling()
         
         # MLP
         self.net = nn.Sequential(
@@ -106,7 +136,7 @@ class MLPBetaCalibrationHead(CalibrationHead):
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """MLP confidence then beta-calibrated probability."""
-        confidence = self.net(features).squeeze(-1)
+        confidence = self.net(self.scale_inputs(features)).squeeze(-1)
         confidence = torch.clamp(confidence, self.eps, 1 - self.eps)
 
         a = torch.exp(self.log_a)
@@ -187,7 +217,7 @@ class BetaCalibrationHead(CalibrationHead):
 
 
 class WeightedBetaCalibrationHead(CalibrationHead):
-    """Linear combination of features -> confidence, then beta calibration."""
+    """Sigmoid of a linear combination of features -> confidence, then beta calibration."""
 
     def __init__(self, in_features: int, device: torch.device, eps=1e-6):
         """
@@ -203,6 +233,7 @@ class WeightedBetaCalibrationHead(CalibrationHead):
         self.eps = eps
         self.in_features = in_features
         self.device = device
+        self.register_input_scaling()
         
         # Weighted sum
         self.weight_net = nn.Linear(in_features, 1, device=self.device)
@@ -213,8 +244,12 @@ class WeightedBetaCalibrationHead(CalibrationHead):
         self.c = nn.Parameter(torch.tensor(0.0, device=self.device))
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """Weighted feature sum, clamp, then beta calibration."""
-        confidence = self.weight_net(features).squeeze(-1)
+        """Weighted feature sum, sigmoid, then beta calibration.
+
+        The sigmoid keeps every record's gradient alive; clamping the raw sum
+        to ``[eps, 1 - eps]`` would zero it wherever the sum falls outside.
+        """
+        confidence = torch.sigmoid(self.weight_net(self.scale_inputs(features)).squeeze(-1))
         confidence = torch.clamp(confidence, self.eps, 1 - self.eps)
 
         a = torch.exp(self.log_a)

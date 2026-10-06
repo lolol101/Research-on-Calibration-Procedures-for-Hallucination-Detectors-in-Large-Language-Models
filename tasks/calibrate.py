@@ -1,9 +1,7 @@
 """Train and evaluate calibration heads on a collected ``Index``.
 
-Command-line equivalent of the notebooks under ``legacy/baseline_calibrations/``
-and ``legacy/experiment_calibrations/``, parameterised by model, dataset,
-response regime and method, so that several runs can go side by side, one
-process per GPU::
+Parameterised by model, dataset, response regime and method, so that several
+runs can go side by side, one process per GPU::
 
     python tasks/calibrate.py --model Qwen/Qwen3-4B \\
         --dataset hellaswag --regime cot --method experiment --gpu 0
@@ -130,6 +128,11 @@ def parse_args():
         help="Use attention scores only, without the final-token confidence.",
     )
     experiment.add_argument(
+        "--answer-only",
+        action="store_true",
+        help="CoT only: use the answer-token scores without the reasoning-span statistics.",
+    )
+    experiment.add_argument(
         "--hs-size",
         type=int,
         default=50,
@@ -169,6 +172,8 @@ def experiment_log_subdir(args):
         name for name, enabled in (("l1", args.l1), ("l2", args.l2)) if enabled
     ) or "default"
     feature_mode = "attn_only" if args.attn_only else "attn_plus_final"
+    if args.answer_only:
+        feature_mode += "_answer_only"
     return os.path.join(f"logs_{regularisation}_hs_{args.hs_size}", feature_mode)
 
 
@@ -240,6 +245,7 @@ def main():
             regime=args.regime,
             device=device,
             attn_only=args.attn_only,
+            answer_only=args.answer_only,
             hs_size=args.hs_size,
             best_heads_group_size=args.best_heads,
             heads_group_sizes=args.heads_group_sizes,
