@@ -13,7 +13,8 @@ read from the stored records, so a new model needs no extra configuration.
 Logs follow the notebook layout under
 ``<logs-dir>/<index_name>/<method>/...``; for ``experiment`` the path also
 carries the regularisation, the head-selection sample size and the feature
-mode, e.g. ``logs_l1_hs_50/attn_plus_final/``.
+mode, e.g. ``logs_l1_hs_50/attn_plus_final/``; for ``logreg`` the
+head-selection sample size, e.g. ``logs_hs_50/``.
 
 A run that finishes writes ``completed.txt`` into its log directory. With
 ``--skip-done`` such a run is skipped, and the log directory of an interrupted
@@ -35,7 +36,7 @@ if str(REPO_ROOT) not in sys.path:
 from services.common.datasets import DATASETS, REGIMES, get_dataset
 from services.common.logging_utils import log_data
 
-METHODS = ("baseline", "experiment")
+METHODS = ("baseline", "experiment", "logreg")
 COMPLETION_MARKER = "completed.txt"
 
 
@@ -65,7 +66,10 @@ def parse_args():
         "--method",
         required=True,
         choices=METHODS,
-        help='"baseline": raw, beta and temperature; "experiment": attention-head calibration.',
+        help=(
+            '"baseline": final-layer calibrators; "experiment": attention-head calibration; '
+            '"logreg": logistic regression on the HEAT inputs, with and without attention scores.'
+        ),
     )
     parser.add_argument(
         "--iterations",
@@ -190,7 +194,7 @@ def main():
     import torch
 
     from services.baseline.pipeline import run_baseline_calibrations
-    from services.experiment.pipeline import run_experiment_calibrations
+    from services.experiment.pipeline import run_experiment_calibrations, run_logreg_calibrations
     from services.feature_cache import FeatureCache
     from services.index import Index
 
@@ -214,6 +218,8 @@ def main():
     log_dir = os.path.join(args.logs_dir, index_name, args.method)
     if args.method == "experiment":
         log_dir = os.path.join(log_dir, experiment_log_subdir(args))
+    elif args.method == "logreg":
+        log_dir = os.path.join(log_dir, f"logs_hs_{args.hs_size}")
 
     if args.skip_done:
         if os.path.exists(os.path.join(log_dir, COMPLETION_MARKER)):
@@ -232,6 +238,20 @@ def main():
             cache=cache,
             device=device,
             search_trials=args.search_trials,
+            search_seed=args.seed,
+            split_seed=args.seed,
+            bootstrap=args.bootstrap,
+            verbose=args.verbose,
+            logging=True,
+            log_dir=log_dir,
+        )
+    elif args.method == "logreg":
+        run_logreg_calibrations(
+            cache=cache,
+            device=device,
+            hs_size=args.hs_size,
+            best_heads_group_size=args.best_heads,
+            heads_group_sizes=args.heads_group_sizes,
             search_seed=args.seed,
             split_seed=args.seed,
             bootstrap=args.bootstrap,

@@ -6,6 +6,7 @@ from tqdm import tqdm
 
 from .baseline import data_process_utils as baseline_processing
 from .common.datasets import COT_REGIME, CROPPED_REGIME, letter_answer_label
+from .common.llm_interface import SCORE_SOURCE
 from .experiment.cot import data_process_utils as cot_processing
 from .experiment.cropped import data_process_utils as cropped_processing
 from .index import Index, split_positions
@@ -56,6 +57,10 @@ class FeatureCache:
     head only, so selecting columns reproduces the per-selection computation.
     Records those functions skip are skipped here too; ``positions`` maps rows
     back to index positions.
+
+    Indices collected before scores were taken from the raw logits hold
+    final-layer scores after the repetition penalty, the temperature and
+    top-p; they are refused.
     """
 
     def __init__(
@@ -74,9 +79,18 @@ class FeatureCache:
             answer_label: Callable mapping ``dataset_elem`` to the expected answer.
             chunk_size: Records processed at once while building.
             verbose: If True, show build progress.
+
+        Raises:
+            ValueError: If the index holds final-layer scores taken after the
+                sampling processors.
         """
         self.index = index
         self.path = f"{index.base_filename}_features.pt"
+        if index.load_records([0])[0].get("score_source") != SCORE_SOURCE:
+            raise ValueError(
+                f"{index.base_filename} holds final-layer scores taken after the sampling "
+                f"processors; collect it again with tasks/launch.py."
+            )
         meta = {
             "version": CACHE_VERSION,
             "regime": regime,
@@ -187,6 +201,23 @@ class FeatureCache:
         data = {"labels": self.labels[rows]}
         data.update({key: value[rows] for key, value in self.baseline.items()})
         return CachedSplit({key: value.to(device) for key, value in data.items()})
+
+    def attention_entropy_split(self, split: str, device: torch.device, split_seed: Optional[int] = None):
+        """Answer-token attention entropy of every head for a split, in float32.
+
+        Args:
+            split: One of ``"train"``, ``"val"``, or ``"test"``.
+            device: Target device for the tensors.
+            split_seed: Seed of the train/val/test shuffle; ``None`` keeps order.
+
+        Returns:
+            ``CachedSplit`` with ``labels`` and ``attention_entropy``, ``[B, L, H]``.
+        """
+        rows = self._rows(split, split_seed)
+        return CachedSplit({
+            "labels": self.labels[rows].to(device),
+            "attention_entropy": self.attention_entropy[rows].to(device, torch.float32),
+        })
 
     def head_selection_data(
         self,

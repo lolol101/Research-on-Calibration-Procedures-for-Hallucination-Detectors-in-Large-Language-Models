@@ -33,9 +33,7 @@ def run_baseline_calibrations(
     The heads are fitted on the train split,
     hyperparameters are chosen on the val split, and the best model is
     evaluated on the test split. Platt scaling and isotonic regression are
-    fitted on the same final-token probability; ``logreg_all_heads`` is an
-    L1 logistic regression over the scores of all attention heads, without
-    head selection.
+    fitted on the same final-token probability.
 
     Args:
         cache: ``FeatureCache`` of the index to calibrate.
@@ -51,9 +49,8 @@ def run_baseline_calibrations(
         log_dir: Root directory for logs; required when ``logging=True``.
 
     Returns:
-        Dict mapping ``"raw"``, ``"beta"``, ``"temperature"``, ``"platt"``,
-        ``"isotonic"`` and ``"logreg_all_heads"`` to the test metrics returned
-        by ``test_calibration_model``.
+        Dict mapping ``"raw"``, ``"beta"``, ``"temperature"``, ``"platt"`` and
+        ``"isotonic"`` to the test metrics returned by ``test_calibration_model``.
 
     Raises:
         ValueError: If ``logging=True`` and ``log_dir`` is not set.
@@ -190,27 +187,5 @@ def run_baseline_calibrations(
             isotonic.predict(test_data["features"].reshape(-1).cpu().numpy())
         ).to(torch.float32),
     )
-
-    # No head selection: every head's score enters an L1 logistic regression.
-    _, layers_count, heads_count = cache.attention_entropy.shape # [N, L, H]
-    all_layers = torch.arange(layers_count).repeat_interleave(heads_count) # [L * H]
-    all_heads = torch.arange(heads_count).repeat(layers_count) # [L * H]
-    all_heads_data = {
-        split: cache.experiment_split(
-            split, all_layers, all_heads, device, split_seed=split_seed
-        ).get()
-        for split in ("train", "val", "test")
-    }
-    logreg = fit_logistic_regression(
-        all_heads_data["train"]["features"],
-        all_heads_data["train"]["labels"],
-        all_heads_data["val"]["features"],
-        all_heads_data["val"]["labels"],
-        device=device,
-        penalty="l1",
-        logging=logging,
-        log_dir=method_log_dir("logreg_all_heads", "train"),
-    )
-    evaluate("logreg_all_heads", predict(logreg["model"], all_heads_data["test"]["features"]))
 
     return results

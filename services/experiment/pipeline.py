@@ -4,6 +4,7 @@ from typing import Optional, Sequence
 import torch
 from tqdm import tqdm
 
+from ..baseline.calibration_utils import fit_logistic_regression
 from ..common.calibration_heads import (
     MLPBetaCalibrationHead,
     MLPCalibrationHead,
@@ -36,6 +37,9 @@ CALIBRATION_HEADS = {
     "mlp+beta": MLPBetaCalibrationHead,
     "weighted_beta": WeightedBetaCalibrationHead,
 }
+
+# Inverse L2 strengths searched by the logistic-regression probes.
+LOGREG_C_GRID = (1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
 
 
 def select_heads(
@@ -249,5 +253,133 @@ def run_experiment_calibrations(
                     random_seed=search_seed,
                     save_predictions=True,
                 )
+
+    return results
+
+
+def run_logreg_calibrations(
+    cache: FeatureCache,
+    device: torch.device,
+    hs_size: int = 50,
+    best_heads_group_size: int = 30,
+    heads_group_sizes: Sequence[int] = (1, 3, 5, 7, 10, 15, 20, 30),
+    search_seed: Optional[int] = None,
+    split_seed: Optional[int] = None,
+    bootstrap: bool = False,
+    verbose: bool = False,
+    logging: bool = False,
+    log_dir: Optional[str] = None,
+):
+    """
+    Logistic regression on the inputs of HEAT, without and with attention scores.
+
+    The features are those of the experiment's attn+final mode, so the probes
+    differ from HEAT only in the model, and from one another only in the
+    attention scores they get. Probes: ``final`` (the final-token score of
+    every block alone); each selector of ``select_heads`` with its leading
+    ``heads_group_sizes`` heads added; ``all`` with every head added. One L2
+    search throughout: ``C`` is chosen on the val split by ``inv_bss``.
+
+    Args:
+        cache: ``FeatureCache`` of the index to calibrate.
+        device: torch.device to perform computations on.
+        hs_size: Number of leading val records used for head selection; 0 uses all.
+        best_heads_group_size: How many (layer, head) pairs to select.
+        heads_group_sizes: Numbers of selected heads added to the final-token score.
+        search_seed: Seed of the bootstrap resampling.
+        split_seed: Seed for shuffling records before the train/val/test
+            split; ``None`` keeps the contiguous storage order.
+        bootstrap: If True, add bootstrap confidence intervals to test metrics.
+        verbose: If True, show progress and print metrics.
+        logging: If True, write selected heads, training and test logs under ``log_dir``.
+        log_dir: Root directory for logs; required when ``logging=True``.
+
+    Returns:
+        Nested dict ``{probe: {heads_count: metrics}}`` with the test metrics
+        returned by ``test_calibration_model``; ``final`` has heads count 0
+        and ``all`` the number of heads of the model.
+
+    Raises:
+        ValueError: If ``logging=True`` and ``log_dir`` is not set, or a value
+            in ``heads_group_sizes`` exceeds ``best_heads_group_size``.
+    """
+    if logging and not log_dir:
+        raise ValueError("log_dir must be set when logging=True")
+    if max(heads_group_sizes) > best_heads_group_size:
+        raise ValueError(
+            f"heads_group_sizes {list(heads_group_sizes)} exceed "
+            f"best_heads_group_size={best_heads_group_size}"
+        )
+
+    splits = ("train", "val", "test")
+    _, layers_count, heads_count = cache.attention_entropy.shape # [N, L, H]
+    selected_heads = select_heads(
+        cache=cache,
+        best_heads_group_size=best_heads_group_size,
+        hs_size=hs_size,
+        split_seed=split_seed,
+        device=device,
+    )
+
+    no_heads = torch.tensor([], dtype=torch.long)
+    probes = [("final", 0, (no_heads, no_heads))]
+    for selector_name, (best_layers, best_heads) in selected_heads.items():
+        if logging:
+            log_data(
+                data={
+                    rank: (l.item(), h.item())
+                    for rank, (l, h) in enumerate(zip(best_layers, best_heads))
+                },
+                log_dir=log_dir,
+                log_filename=f"best_heads({selector_name}).txt",
+            )
+        probes += [
+            (selector_name, size, (best_layers[:size], best_heads[:size]))
+            for size in heads_group_sizes
+        ]
+    probes.append((
+        "all",
+        layers_count * heads_count,
+        (
+            torch.arange(layers_count).repeat_interleave(heads_count), # [L * H]
+            torch.arange(heads_count).repeat(layers_count), # [L * H]
+        ),
+    ))
+
+    results = {}
+    for probe_name, size, heads in tqdm(probes, desc="logreg: calibrating with various heads"):
+        data = {
+            split: cache.experiment_split(split, *heads, device, split_seed=split_seed).get()
+            for split in splits
+        } # features: [B, blocks * (1 + size)]
+
+        local_log_dir = f"{log_dir}/(logreg)({probe_name})calibration_res/"
+        fit_results = fit_logistic_regression(
+            data["train"]["features"],
+            data["train"]["labels"],
+            data["val"]["features"],
+            data["val"]["labels"],
+            device=device,
+            c_grid=LOGREG_C_GRID,
+            penalty="l2",
+            solver="lbfgs",
+            max_iter=5000,
+            logging=logging,
+            log_dir=local_log_dir + f"train#{size}" if logging else None,
+        )
+        test_probs = torch.from_numpy(
+            fit_results["model"].predict_proba(data["test"]["features"].cpu().numpy())[:, 1]
+        ).to(device=device, dtype=torch.float32)
+        results.setdefault(probe_name, {})[size] = test_calibration_model(
+            test_probs,
+            data["test"]["labels"].to(device=device, dtype=torch.float32),
+            device=device,
+            verbose=verbose,
+            logging=logging,
+            log_dir=local_log_dir + f"test#{size}" if logging else None,
+            bootstrap=bootstrap,
+            random_seed=search_seed,
+            save_predictions=True,
+        )
 
     return results

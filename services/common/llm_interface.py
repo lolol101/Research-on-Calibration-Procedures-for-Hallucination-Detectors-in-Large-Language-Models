@@ -10,6 +10,23 @@ DEFAULT_LOWER_PROB_LIMIT = 1e-8
 DEFAULT_LOWER_LOGIT_LIMIT = -1000
 DEFAULT_UPPER_LOGIT_LIMIT = 1000
 
+# Sampling settings of the collection. They only decide which response is
+# generated: the recorded scores come from the raw logits, before the
+# repetition penalty, the temperature and top-p, which sets every token
+# outside the nucleus to -inf.
+GENERATION_KWARGS = {
+    "max_new_tokens": 512,
+    "do_sample": True,
+    "temperature": 0.7,
+    "repetition_penalty": 1.05,
+    "top_p": 0.8,
+}
+
+# Marks records whose ``score_data`` holds raw-logit scores. Records collected
+# before the marker was introduced hold the processed scores and are refused
+# by ``FeatureCache``.
+SCORE_SOURCE = "raw_logits"
+
 
 class LLMInterface(Runnable):
     def __init__(
@@ -27,7 +44,7 @@ class LLMInterface(Runnable):
         Initialization of a class.
 
         Args:
-            model: Causal LM with ``generate`` supporting scores and attentions.
+            model: Causal LM with ``generate`` supporting logits and attentions.
             tokenizer: Chat-template-capable tokenizer.
             device: torch.device to perform computations on.
             topk: Number of top logits/probs stored per generated token.
@@ -46,6 +63,50 @@ class LLMInterface(Runnable):
 
         self.model = self.model.to(device)
 
+    def score_tokens(self, logits, token_ids):
+        """Per-token score dicts from raw next-token logits.
+
+        All tokens are scored at once on the logits' device, so a long
+        response costs a few kernel launches rather than several per token.
+
+        Args:
+            logits: Next-token logits, one ``[V]`` row per scored token.
+            token_ids: Ids of the scored tokens, aligned with ``logits``.
+
+        Returns:
+            List of dicts with ``token``, ``prob``, ``logit``, ``top_tokens``,
+            ``top_logits`` and ``top_probs`` per token.
+        """
+        logits = torch.stack([row.reshape(-1) for row in logits]).float() # [T, V]
+        token_ids = torch.as_tensor(token_ids, device=logits.device).reshape(-1, 1) # [T, 1]
+        probs = torch.softmax(logits, dim=-1) # [T, V]
+
+        top_logits, top_tok_ids = torch.topk(logits, self.topk, dim=-1) # [T, TOP_K]
+        top_logits = torch.clamp(
+            top_logits,
+            min=self.lower_logit_limit,
+            max=self.upper_logit_limit,
+        ).cpu()
+        top_probs = torch.topk(probs, self.topk, dim=-1).values.cpu() # [T, TOP_K]
+
+        tokens = self.tokenizer.batch_decode(token_ids.tolist())
+        token_probs = probs.gather(1, token_ids).squeeze(1).tolist()
+        token_logits = logits.gather(1, token_ids).squeeze(1).tolist()
+        top_tokens = self.tokenizer.batch_decode(top_tok_ids.reshape(-1, 1).tolist())
+
+        # Rows are cloned: a pickled view would carry the storage of all tokens.
+        return [
+            {
+                "token": tokens[t],
+                "prob": token_probs[t],
+                "logit": token_logits[t],
+                "top_tokens": top_tokens[t * self.topk : (t + 1) * self.topk],
+                "top_logits": top_logits[t].clone(),
+                "top_probs": top_probs[t].clone(),
+            }
+            for t in range(len(tokens))
+        ]
+
     def invoke(
         self,
         messages: List[Any],
@@ -60,8 +121,8 @@ class LLMInterface(Runnable):
             **kwargs: Extra generation.
 
         Returns:
-            Dict with ``input_text``, ``output_text``, ``score_data`` (per-token dicts), 
-            ``attention_entropy``, and ``norm_attention_entropy``.
+            Dict with ``input_text``, ``output_text``, ``score_data`` (per-token dicts),
+            ``score_source``, ``attention_entropy``, and ``norm_attention_entropy``.
         """
         hf_messages = [
             {"role": "system", "content": messages.messages[0].content},
@@ -83,48 +144,15 @@ class LLMInterface(Runnable):
         with torch.no_grad():
             response = self.model.generate(
                 **model_inputs,
-                max_new_tokens=512,
-                output_scores=True,
+                output_logits=True,
                 output_attentions=True,
                 return_dict_in_generate=True,
-                do_sample=True,
-                temperature=0.7,
-                repetition_penalty=1.05,
-                top_p=0.8,
                 pad_token_id=self.tokenizer.eos_token_id,
+                **GENERATION_KWARGS,
             )
 
-        token_data = []
         generated_ids = response.sequences[:, model_inputs["input_ids"].shape[1] :].squeeze(0)
-        for i, logits in enumerate(response.scores):
-            logits = logits.squeeze(0)
-            probs = torch.softmax(logits, dim=-1)
-
-            top_logits, top_tok_ids = torch.topk(logits, self.topk, dim=-1)
-            top_logits = torch.clamp(
-                top_logits,
-                min=self.lower_logit_limit,
-                max=self.upper_logit_limit,
-            )
-
-            top_probs, _ = torch.topk(probs, self.topk, dim=-1)
-            top_probs = top_probs.cpu()
-
-            top_tokens = []
-            for j in range(top_tok_ids.shape[-1]):
-                top_tokens.append(self.tokenizer.decode(top_tok_ids[j].item()))
-
-            token_id = generated_ids[i]
-            token_data.append(
-                {
-                    "token": self.tokenizer.decode(token_id),
-                    "prob": probs[token_id].cpu().item(),
-                    "logit": logits[token_id].cpu().item(),
-                    "top_tokens": top_tokens,
-                    "top_logits": top_logits.cpu(),
-                    "top_probs": top_probs,
-                }
-            )
+        token_data = self.score_tokens(response.logits, generated_ids)
 
         output_attetntions = [
             torch.stack(token_attention).squeeze(1).clamp(min=self.lower_prob_limit).cpu()
@@ -145,6 +173,7 @@ class LLMInterface(Runnable):
                 skip_special_tokens=True,
             ),
             "score_data": token_data,
+            "score_source": SCORE_SOURCE,
             "attention_entropy": attn_entropy,
             "norm_attention_entropy": norm_attn_entropy,
         }

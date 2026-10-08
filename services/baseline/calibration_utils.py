@@ -571,6 +571,8 @@ def fit_logistic_regression(
     device: torch.device,
     c_grid=(1e-3, 1e-2, 1e-1, 1.0),
     penalty: Literal["l1", "l2"] = "l1",
+    solver: str = "liblinear",
+    max_iter: int = 1000,
     logging: bool = False,
     log_dir: Optional[str] = None,
 ):
@@ -578,9 +580,10 @@ def fit_logistic_regression(
     Logistic regression on standardized features, with ``C`` chosen on validation.
 
     Used for Platt scaling (one feature, weak L2 penalty) and for the
-    no-selection baseline (all attention heads, L1 penalty). Every ``C`` in
-    ``c_grid`` is fitted on the training set; the one with the lowest
-    validation ``inv_bss`` is kept, as for the gradient-trained heads.
+    logistic-regression probes of ``services/experiment`` (final-layer
+    outputs with and without attention scores). Every ``C`` in ``c_grid`` is
+    fitted on the training set; the one with the lowest validation
+    ``inv_bss`` is kept, as for the gradient-trained heads.
 
     Args:
         X_train: Training features, shape ``[B, F]``.
@@ -590,6 +593,8 @@ def fit_logistic_regression(
         device: torch.device for metric computation.
         c_grid: Inverse regularization strengths to try.
         penalty: ``"l1"`` or ``"l2"``.
+        solver: scikit-learn solver.
+        max_iter: Iteration limit of the solver.
         logging: If True, write the chosen ``C`` and validation metrics to ``log_dir``.
         log_dir: Directory for the log; required when ``logging=True``.
 
@@ -607,7 +612,7 @@ def fit_logistic_regression(
     for c in c_grid:
         model = make_pipeline(
             StandardScaler(),
-            LogisticRegression(penalty=penalty, C=c, solver="liblinear", max_iter=1000, random_state=0),
+            LogisticRegression(penalty=penalty, C=c, solver=solver, max_iter=max_iter, random_state=0),
         )
         model.fit(X_train.cpu().numpy(), y_train.cpu().numpy())
         val_probs = torch.from_numpy(model.predict_proba(X_val.cpu().numpy())[:, 1]).to(torch.float32)

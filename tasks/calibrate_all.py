@@ -7,8 +7,9 @@ combination, one after another on a single GPU::
     python tasks/calibrate_all.py --model Qwen/Qwen2.5-7B-Instruct --gpu 0
 
 For every index the queue holds the baseline and, per head-selection sample
-size, the experiment with and without the final-token score. Several models
-can run side by side, one queue per GPU.
+size, the experiment in each feature mode of ``--modes`` and the
+logistic-regression probes. Several models can run side by side, one queue
+per GPU.
 
 Each run is a separate process, so the memory an index occupies is released
 before the next run starts. A failed run does not stop the queue; its output
@@ -29,11 +30,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from services.common.datasets import DATASETS, REGIMES
+from services.common.datasets import COT_REGIME, DATASETS, REGIMES
 
 CALIBRATE_SCRIPT = REPO_ROOT / "tasks" / "calibrate.py"
-METHODS = ("baseline", "experiment")
+METHODS = ("baseline", "experiment", "logreg")
 FULL_VAL_SPLIT = 0
+# Experiment feature modes and the calibrate.py flags selecting them;
+# answer_only applies to CoT indices only.
+MODES = {
+    "attn_plus_final": [],
+    "attn_only": ["--attn-only"],
+    "answer_only": ["--answer-only"],
+}
 
 
 def hs_size(value):
@@ -75,14 +83,24 @@ def parse_args():
         nargs="+",
         choices=METHODS,
         default=list(METHODS),
-        help="Methods to include (default: baseline experiment).",
+        help="Methods to include (default: baseline experiment logreg).",
+    )
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=list(MODES),
+        default=list(MODES),
+        help=(
+            "Experiment feature modes; answer_only (CoT indices only) drops the "
+            "reasoning-span statistics (default: all)."
+        ),
     )
     parser.add_argument(
         "--hs-sizes",
         nargs="+",
         type=hs_size,
-        default=[50, 500, 1000, FULL_VAL_SPLIT],
-        help='Head-selection sample sizes; "full" uses the whole val split (default: 50 500 1000 full).',
+        default=[50, 100, 500, 1000, FULL_VAL_SPLIT],
+        help='Head-selection sample sizes; "full" uses the whole val split (default: 50 100 500 1000 full).',
     )
     parser.add_argument(
         "--iterations",
@@ -132,17 +150,23 @@ def build_queue(args, model_slug):
             common = ["--model", args.model, "--dataset", dataset, "--regime", regime]
             if "baseline" in args.methods:
                 queue.append((f"{index_name}__baseline", common + ["--method", "baseline"]))
-            if "experiment" in args.methods:
-                for size in args.hs_sizes:
-                    size_tag = "full" if size == FULL_VAL_SPLIT else str(size)
-                    for attn_only in (False, True):
-                        mode = "attn_only" if attn_only else "attn_plus_final"
+            for size in args.hs_sizes:
+                size_tag = "full" if size == FULL_VAL_SPLIT else str(size)
+                if "experiment" in args.methods:
+                    for mode in args.modes:
+                        if mode == "answer_only" and regime != COT_REGIME:
+                            continue
                         queue.append((
                             f"{index_name}__experiment__hs_{size_tag}__{mode}",
                             common
                             + ["--method", "experiment", "--hs-size", str(size)]
-                            + (["--attn-only"] if attn_only else []),
+                            + MODES[mode],
                         ))
+                if "logreg" in args.methods:
+                    queue.append((
+                        f"{index_name}__logreg__hs_{size_tag}",
+                        common + ["--method", "logreg", "--hs-size", str(size)],
+                    ))
     return queue, missing
 
 
