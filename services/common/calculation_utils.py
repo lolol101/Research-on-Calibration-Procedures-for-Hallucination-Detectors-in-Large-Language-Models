@@ -334,11 +334,12 @@ def calculate_metrics_bootstrap_ci(
     ):
         resample_ids = torch.randint(
             0, n_samples, (n_samples,), generator=generator
-        ).to(labels.device)
+        )
 
+        # Probabilities and labels may live on different devices.
         resample_metrics = calculate_calibration_metrics(
-            token_probs[resample_ids],
-            labels[resample_ids],
+            token_probs[resample_ids.to(token_probs.device)],
+            labels[resample_ids.to(labels.device)],
             device=device,
             n_bins=n_bins,
             eps=eps,
