@@ -1,55 +1,84 @@
-# Hallucination_Research
+# HEAT: Head-Entropy Attention-Aware Calibration of LLM Hallucination Detectors
 
-## Project Title
+Code for the paper. HEAT calibrates the confidence of an LLM's answer from the
+attention entropy of selected heads together with the final-layer score of the
+answer token. The repository collects model responses with per-token scores
+and attention entropies, selects heads, trains the calibrators and the
+baselines, and evaluates transfer between datasets.
 
-**Research on Calibration Procedures for Hallucination Detectors in Large Language Models**
+## Setup
 
-## Description
+Python 3.12, [uv](https://docs.astral.sh/uv/):
 
-This project focuses on improving the calibration process of Large Language Models (LLMs). Hallucinations refer to outputs that are fluent and plausible but factually incorrect. The goal of this research is to develop a novel calibration method that produces confidence scores aligned with the true correctness of model responses.
+```bash
+uv sync                 # torch 2.5.1, CUDA 12.4 (the reported results)
+uv sync --no-default-groups --group local   # torch 2.7.1, CUDA 12.8, for RTX 50xx GPUs
+```
 
-Unlike existing approaches that rely mainly on final output probabilities, this work leverages internal model signals, including attention mechanisms and intermediate reasoning steps (Chain of Thought). The proposed method uses entropy-based metrics to extract uncertainty information and improve calibration quality.
+Gated models need `HF_TOKEN` in the environment.
 
-## Key Ideas
+## Data
 
-* Use internal attention states instead of only final output logits
-* Incorporate reasoning traces (Chain of Thought) for richer signals
-* Apply entropy-based estimation for uncertainty measurement
-* Select “hallucination-aware” attention heads based on separation ability
-* Aggregate multiple signals into a calibrated confidence score
+Models: `Qwen/Qwen2.5-0.5B-Instruct` (cropped), `Qwen/Qwen2.5-3B-Instruct`,
+`Qwen/Qwen2.5-7B-Instruct`, `meta-llama/Meta-Llama-3-8B-Instruct` (cropped
+and CoT). Datasets: MMLU-Pro, RACE, CosmosQA, 12 000 rows each. Regimes:
+`cropped` (the answer only) and `cot` (reasoning, then the answer).
 
-## Methodology
+```bash
+python tasks/launch.py --model Qwen/Qwen2.5-7B-Instruct --dataset mmlu-pro --regime cot
+```
 
-The approach consists of two main stages:
+Llama-3 in the cropped regime was collected with `--no-example`. Each run
+writes an index to `index_data/<model>_<dataset>_<regime>_12000_{data,index}.pkl`:
+per record the generated tokens with their raw-logit top-30 scores and the
+attention entropy of every head. A record carries its train/val/test split
+(60/20/20 by a seeded hash of the dataset row).
 
-1. **Attention Head Selection**
-   Identify attention heads that best distinguish between factual and hallucinated outputs using entropy-based separation metrics.
+## Calibration
 
-2. **Confidence Aggregation and Calibration**
-   Combine signals from selected attention heads and output layers into a single confidence score. Apply calibration techniques such as temperature scaling, beta calibration and MLP head to align scores with true probabilities.
+All methods for one model, every index found in `index_data/`:
 
-## Models
+```bash
+python tasks/calibrate_all.py --model Qwen/Qwen2.5-7B-Instruct --gpu 0 \
+    --bootstrap --best-heads 200 --heads-group-sizes 1 3 5 7 10 15 20 30 50 100 200
+```
 
-Experiments are conducted on open-source LLMs with accessible internal states:
+The queue runs `tasks/calibrate.py` per index with
 
-* Qwen2.5-7B-Instruct
-* Llama3-8B
+- `--method baseline`: Platt, temperature, isotonic and beta calibration of the
+  final-layer score;
+- `--method logreg`: logistic regression on the final layer alone, with
+  selected heads and with all heads;
+- `--method experiment`: HEAT with head selection by HDP and ROC AUC on the
+  first `--hs-size` validation records (50, 100, 500, 1000, all), with
+  attention and the final layer, attention only, and, for CoT, the answer
+  token without the reasoning span.
 
-## Datasets
+Logs and test metrics go to `logs/<index>/<method>/`. The reported numbers ran
+the baseline and the logistic regression on CPU and HEAT on GPU; other devices
+agree up to floating-point rounding.
 
-* MMLU-PRO
-* RACE
+## Transfer
 
-These datasets provide labeled data necessary for evaluating hallucination detection and calibration.
+```bash
+python tasks/transfer.py --model Qwen/Qwen2.5-7B-Instruct --regime cot --baseline beta
+```
 
-## Evaluation
+Fits each method on one dataset and evaluates it on the test split of the
+others as is, fine-tuned on n labelled target answers, and fitted from scratch
+on them. Needs the HEAT runs of `calibrate_all.py`; results go to
+`logs/transfer/<model>_<regime>.csv`.
 
-The method is evaluated using:
+## Layout
 
-* **Head Selection:** ROC-AUC and HDP scores to define attetnion heads which better distinguish hallucinated from factual outputs
-* **Calibration Quality:** Expected Calibration Error (ECE) and its variants
+- `services/common/` — generation with per-token scores and attention entropy,
+  metrics (ECE, Brier decomposition, AUROC), calibration heads.
+- `services/index.py` — record store and train/val/test split.
+- `services/feature_cache.py` — calibration inputs of an index, computed once.
+- `services/baseline/`, `services/experiment/` — baselines, head selection,
+  HEAT and the logistic regression; `services/experiment/transfer.py`.
+- `tasks/` — the entry points above.
 
-## Expected Outcomes
+## License
 
-* Improved calibration of confidence scores
-* Enhanced understanding of internal model signals for uncertainty estimation
+MIT.
