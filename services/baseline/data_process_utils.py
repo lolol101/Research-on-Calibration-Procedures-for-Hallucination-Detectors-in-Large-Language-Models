@@ -33,8 +33,7 @@ def process_elements_main(
 
     For each element in ``index_data``, locates the multiple-choice answer
     token, derives binary correctness labels, and stacks final-token
-    confidence (``features``) plus top-k logits (``logits``). Elements whose
-    answer token is the last scored position are skipped.
+    confidence (``features``) plus top-k logits (``logits``).
 
     Args:
         index_data: Array of dicts with ``score_data`` (token scores) and
@@ -60,11 +59,6 @@ def process_elements_main(
     answer_tok_ids, gen_tok_ids = [], []
     for elem in index_data:
         answer_token_index = retrieve_answer_token_index(elem["score_data"])
-
-        # TODO: It must be resolved on data collecting stage
-        if answer_token_index == len(elem["score_data"]) - 1:
-            continue            
-        
         answer_token = elem["score_data"][answer_token_index]["token"]
         expected_answer = answer_label(elem["dataset_elem"])
         labels.append(torch.tensor(answer_token == expected_answer))
@@ -91,11 +85,6 @@ def process_elements_main(
         desc="Processing data...",
         disable=not verbose,
     ):
-        # TODO: It must be resolved on data collecting stage
-        answer_token_index = retrieve_answer_token_index(elem["score_data"])
-        if answer_token_index == len(elem["score_data"]) - 1:
-            continue
-        
         captured_idx = retrieve_answer_token_index(elem["score_data"])
                     
         final_token_prob = torch.tensor(

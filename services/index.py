@@ -23,32 +23,37 @@ class Index:
         self.data_filename = f"{base_filename}_data.pkl"
         self.offsets = []
         self.iterations = []
+        self.splits = []
         self.__load_index()
 
     def __load_index(self):
-        """Loads ``offsets`` and ``iterations`` from the index pickle if it exists."""
+        """Loads ``offsets``, ``iterations`` and ``splits`` from the index pickle if it exists."""
         if os.path.exists(self.index_filename):
             with open(self.index_filename, 'rb') as f:
                 index_data = pickle.load(f)
                 self.offsets = index_data.get('offsets', [])
                 self.iterations = index_data.get('iterations', [])
+                self.splits = index_data.get('splits', [None] * len(self.offsets))
             
     def __save_index(self):
-        """Persists current ``offsets`` and ``iterations`` to the index pickle."""
+        """Persists current ``offsets``, ``iterations`` and ``splits`` to the index pickle."""
         index_data = {
             'offsets': self.offsets,
-            'iterations': self.iterations
+            'iterations': self.iterations,
+            'splits': self.splits
         }
         with open(self.index_filename, 'wb') as f:
             pickle.dump(index_data, f)
             
-    def save_data(self, data, iter=-1, logging=False):
+    def save_data(self, data, iter=-1, logging=False, split=None):
         """Appends one pickled record and update the offset index.
 
         Args:
             data: Arbitrary Python object to pickle.
             iter: Iteration id stored alongside the offset (-1 if unknown).
             logging: If True, print a short confirmation message.
+            split: Fixed split of the record (``"train"``, ``"val"`` or
+                ``"test"``); ``None`` leaves it to ``split_positions``.
         """
         mode = "ab" if os.path.exists(self.data_filename) else "wb"
         with open(self.data_filename, mode) as f:
@@ -57,6 +62,7 @@ class Index:
             
             self.offsets.append(offset)
             self.iterations.append(iter)
+            self.splits.append(split)
             self.__save_index()
                  
         if logging:
@@ -147,8 +153,12 @@ class Index:
         
         self.offsets = []
         self.iterations = []
+        self.splits = []
         
         print("Index is cleared successfully.")
+
+
+SPLITS = ("train", "val", "test")
 
 
 def _split_rank(seed, row_id):
@@ -160,6 +170,10 @@ def _split_rank(seed, row_id):
 def split_positions(index, split, train_split=0.6, val_split=0.8, split_seed=None):
     """Record positions of one train/val/test split, in split order.
 
+    If every record has a fixed split, the records of that split are
+    returned and the fractions are not used; if none has one, the records
+    are divided by the fractions.
+
     Args:
         index: ``Index`` whose records are split.
         split: One of ``"train"``, ``"val"``, or ``"test"``.
@@ -170,6 +184,10 @@ def split_positions(index, split, train_split=0.6, val_split=0.8, split_seed=Non
 
     Returns:
         List of record positions (offset indices) in the split.
+
+    Raises:
+        ValueError: If only some records have a fixed split, or a fixed
+            split is not one of ``SPLITS``.
     """
     order = list(range(len(index)))
     if split_seed is not None:
@@ -178,6 +196,20 @@ def split_positions(index, split, train_split=0.6, val_split=0.8, split_seed=Non
         # Ranking by a hash of the dataset row keeps a question in the same
         # split across models and regimes collected from that dataset.
         order.sort(key=lambda i: _split_rank(split_seed, index.iterations[i]))
+
+    fixed = sum(s is not None for s in index.splits)
+    if fixed:
+        if fixed != len(index):
+            raise ValueError(
+                f"{index.base_filename}: {fixed} of {len(index)} records have a fixed "
+                f"split; expected all or none."
+            )
+        unknown = set(index.splits) - set(SPLITS)
+        if unknown:
+            raise ValueError(
+                f"{index.base_filename}: unknown splits {sorted(unknown)}; expected {SPLITS}."
+            )
+        return [i for i in order if index.splits[i] == split]
 
     train_end = int(len(index) * train_split)
     val_end = int(len(index) * val_split)

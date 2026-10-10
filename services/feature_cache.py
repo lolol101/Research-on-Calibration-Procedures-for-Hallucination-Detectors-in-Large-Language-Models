@@ -6,7 +6,6 @@ from tqdm import tqdm
 
 from .baseline import data_process_utils as baseline_processing
 from .common.datasets import COT_REGIME, CROPPED_REGIME, letter_answer_label
-from .common.llm_interface import SCORE_SOURCE
 from .experiment.cot import data_process_utils as cot_processing
 from .experiment.cropped import data_process_utils as cropped_processing
 from .index import Index, split_positions
@@ -55,12 +54,7 @@ class FeatureCache:
     The tensors are produced by the same ``process_elements_*`` functions the
     ``IndexDataset`` path uses, and every feature column depends on its own
     head only, so selecting columns reproduces the per-selection computation.
-    Records those functions skip are skipped here too; ``positions`` maps rows
-    back to index positions.
-
-    Indices collected before scores were taken from the raw logits hold
-    final-layer scores after the repetition penalty, the temperature and
-    top-p; they are refused.
+    ``positions`` maps rows back to index positions.
     """
 
     def __init__(
@@ -79,18 +73,9 @@ class FeatureCache:
             answer_label: Callable mapping ``dataset_elem`` to the expected answer.
             chunk_size: Records processed at once while building.
             verbose: If True, show build progress.
-
-        Raises:
-            ValueError: If the index holds final-layer scores taken after the
-                sampling processors.
         """
         self.index = index
         self.path = f"{index.base_filename}_features.pt"
-        if index.load_records([0])[0].get("score_source") != SCORE_SOURCE:
-            raise ValueError(
-                f"{index.base_filename} holds final-layer scores taken after the sampling "
-                f"processors; collect it again with tasks/launch.py."
-            )
         meta = {
             "version": CACHE_VERSION,
             "regime": regime,
@@ -139,15 +124,6 @@ class FeatureCache:
             chunk_positions = list(range(start, min(start + chunk_size, len(self.index))))
             records = self.index.load_records(chunk_positions)
 
-            # Same skip rule as the process_elements_* functions.
-            kept = [
-                position for position, elem in zip(chunk_positions, records)
-                if processing.retrieve_answer_token_index(elem["score_data"])
-                != len(elem["score_data"]) - 1
-            ]
-            if not kept:
-                continue
-
             selection = processing.process_elements_hdp(
                 records, layers_count, heads_count, cpu, answer_label=answer_label
             )
@@ -158,7 +134,7 @@ class FeatureCache:
                 records, cpu, answer_label=answer_label
             )
 
-            parts["positions"].append(torch.tensor(kept, dtype=torch.long))
+            parts["positions"].append(torch.tensor(chunk_positions, dtype=torch.long))
             parts["labels"].append(selection["labels"])
             parts["attention_entropy"].append(
                 torch.stack(
@@ -182,7 +158,7 @@ class FeatureCache:
         """Cache rows of a split, in the order ``IndexDataset`` would yield them."""
         positions = split_positions(self.index, split, split_seed=split_seed)
         return torch.tensor(
-            [self._row_of[p] for p in positions if p in self._row_of], dtype=torch.long
+            [self._row_of[p] for p in positions], dtype=torch.long
         )
 
     def baseline_split(self, split: str, device: torch.device, split_seed: Optional[int] = None):

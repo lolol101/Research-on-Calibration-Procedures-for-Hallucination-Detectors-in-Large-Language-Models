@@ -53,11 +53,6 @@ def process_elements_main(
     labels = []
     for elem in index_data:
         answer_token_index = retrieve_answer_token_index(elem["score_data"])
-
-        # TODO: It must be resolved on data collecting stage
-        if answer_token_index == len(elem["score_data"]) - 1:
-            continue            
-        
         answer_token = elem["score_data"][answer_token_index]["token"]
         expected_answer = answer_label(elem["dataset_elem"])
         labels.append(torch.tensor(answer_token == expected_answer))
@@ -72,11 +67,6 @@ def process_elements_main(
         desc="Processing data...",
         disable=not verbose,
     ):
-        # TODO: It must be resolved on data collecting stage
-        answer_token_index = retrieve_answer_token_index(elem["score_data"])
-        if answer_token_index == len(elem["score_data"]) - 1:
-            continue
-        
         captured_ids = [retrieve_answer_token_index(elem["score_data"])]
         captured_ids = torch.tensor(captured_ids, device=device)
         
@@ -145,12 +135,7 @@ def process_elements_hdp(
     # Getting labels of if the answer is correct or not 
     labels = []
     for elem in index_data:
-        
-        # TODO: It must be resolved on data collecting stage
         answer_token_index = retrieve_answer_token_index(elem["score_data"])
-        if answer_token_index == len(elem["score_data"]) - 1:
-            continue  
-                  
         answer_token = elem["score_data"][answer_token_index]["token"]
         expected_answer = answer_label(elem["dataset_elem"])
         labels.append(torch.tensor(answer_token == expected_answer))
@@ -158,12 +143,6 @@ def process_elements_hdp(
    
     attn_entropy = []
     for elem in index_data:
-        answer_token_index = retrieve_answer_token_index(elem["score_data"])
-
-        # TODO: It must be resolved on data collecting stage
-        if answer_token_index == len(elem["score_data"]) - 1:
-            continue   
-        
         captured_ids = [retrieve_answer_token_index(elem["score_data"])]
         captured_ids = torch.tensor(captured_ids, device=device)
         

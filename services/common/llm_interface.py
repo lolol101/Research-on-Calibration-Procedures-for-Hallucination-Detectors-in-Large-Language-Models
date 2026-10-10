@@ -22,11 +22,6 @@ GENERATION_KWARGS = {
     "top_p": 0.8,
 }
 
-# Marks records whose ``score_data`` holds raw-logit scores. Records collected
-# before the marker was introduced hold the processed scores and are refused
-# by ``FeatureCache``.
-SCORE_SOURCE = "raw_logits"
-
 
 class LLMInterface(Runnable):
     def __init__(
@@ -122,7 +117,7 @@ class LLMInterface(Runnable):
 
         Returns:
             Dict with ``input_text``, ``output_text``, ``score_data`` (per-token dicts),
-            ``score_source``, ``attention_entropy``, and ``norm_attention_entropy``.
+            ``attention_entropy``, and ``norm_attention_entropy``.
         """
         hf_messages = [
             {"role": "system", "content": messages.messages[0].content},
@@ -173,7 +168,6 @@ class LLMInterface(Runnable):
                 skip_special_tokens=True,
             ),
             "score_data": token_data,
-            "score_source": SCORE_SOURCE,
             "attention_entropy": attn_entropy,
             "norm_attention_entropy": norm_attn_entropy,
         }
